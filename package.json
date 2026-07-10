@@ -1,0 +1,70 @@
+{
+  "name": "translation-resilience",
+  "version": "0.1.0",
+  "description": "Stops browser page translation (Google Translate) from crashing React and silently freezing translated text, by re-adopting displaced text nodes instead of swallowing errors.",
+  "keywords": [
+    "google-translate",
+    "page-translation",
+    "react",
+    "notfounderror",
+    "removechild",
+    "insertbefore",
+    "mutationobserver",
+    "chrome",
+    "i18n",
+    "dom"
+  ],
+  "author": "Alex Speller <alex@alexspeller.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alexspeller/translation-resilience.git"
+  },
+  "bugs": {
+    "url": "https://github.com/alexspeller/translation-resilience/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./simulator": {
+      "types": "./dist/simulator.d.ts",
+      "import": "./dist/simulator.js",
+      "require": "./dist/simulator.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.3",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "jsdom": "^29.1.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
+  },
+  "allowScripts": {
+    "esbuild": true,
+    "fsevents": true
+  }
+}

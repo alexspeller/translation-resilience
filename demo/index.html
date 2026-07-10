@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Google Translate vs React — translation-resilience demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; line-height: 1.5; }
+    .status { padding: 0.5rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-weight: 600; }
+    .on { background: #d7f5dd; }
+    .off { background: #fde2e2; }
+    #app { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; }
+    button { margin-right: 0.5rem; }
+    .hint { color: #555; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <h1>Google Translate crash demo</h1>
+  <div id="shim-status" class="status"></div>
+  <p class="hint">
+    Right-click the page → “Translate to …” (any language), then interact below.
+    Without the shim (<a href="?shim=off">?shim=off</a>): toggling crashes the app
+    and the counter freezes. With the shim (<a href="?">default</a>): everything
+    keeps working and updates get re-translated.
+  </p>
+  <p class="hint">
+    Run <code>npm run build</code> first, then serve the repo root over HTTP
+    (e.g. <code>npx serve .</code>) and open <code>/demo/</code>.
+  </p>
+  <div id="app"></div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"></script>
+  <script type="module">
+    import { installTranslationResilience } from '../dist/index.js';
+    import { startTranslateObserver, translateSubtree } from '../dist/simulator.js';
+
+    const shimEnabled = new URLSearchParams(location.search).get('shim') !== 'off';
+    const statusEl = document.getElementById('shim-status');
+    statusEl.textContent = shimEnabled ? 'Shim: ON (translation resilience installed)' : 'Shim: OFF (stock React behavior)';
+    statusEl.className = `status ${shimEnabled ? 'on' : 'off'}`;
+    if (shimEnabled) installTranslationResilience({ onEvent: (message) => console.debug('translation-resilience:', message) });
+
+    const e = React.createElement;
+
+    function App() {
+      const [count, setCount] = React.useState(4);
+      const [autoTick, setAutoTick] = React.useState(false);
+      const [showWarning, setShowWarning] = React.useState(true);
+      const [showBadge, setShowBadge] = React.useState(false);
+
+      React.useEffect(() => {
+        if (!autoTick) return;
+        const id = setInterval(() => setCount((value) => value + 1), 1000);
+        return () => clearInterval(id);
+      }, [autoTick]);
+
+      return e(React.Fragment, null,
+        e('p', null, 'There are ', count, ' lights in the warehouse today.'),
+        e('p', null,
+          showWarning && 'Warning: obstruction detected in this aisle! ',
+          e('span', null, 'Scanned by robot.')
+        ),
+        e('p', null,
+          showBadge && e('em', null, 'NEW! '),
+          'This sentence has a ', e('a', { href: '#nowhere' }, 'link in the middle'), ' of it.'
+        ),
+        e('p', null,
+          e('button', { id: 'increment', onClick: () => setCount((value) => value + 1) }, 'Increment counter'),
+          e('button', { onClick: () => setAutoTick((value) => !value) }, autoTick ? 'Stop auto-increment' : 'Start auto-increment'),
+          e('button', { id: 'toggle-warning', onClick: () => setShowWarning((value) => !value) }, 'Toggle warning text (removeChild crash)'),
+          e('button', { id: 'toggle-badge', onClick: () => setShowBadge((value) => !value) }, 'Toggle badge (insertBefore crash)')
+        )
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('app')).render(e(App));
+
+    const simulateButton = document.createElement('button');
+    simulateButton.id = 'simulate-translate';
+    simulateButton.textContent = 'Simulate Google Translate (for browsers without it)';
+    simulateButton.addEventListener('click', () => {
+      const app = document.getElementById('app');
+      startTranslateObserver(app);
+      translateSubtree(app);
+      simulateButton.disabled = true;
+    });
+    document.body.appendChild(simulateButton);
+  </script>
+</body>
+</html>
