@@ -17,7 +17,7 @@ When Chrome translates a page, it rewrites the DOM underneath your framework:
 1. Adjacent `Text` nodes are merged (`normalize()`) — so `Lights: {count}` collapses into one run.
 2. The merged run is split into segments (numbers isolated) and each segment is wrapped in nested `<font style="vertical-align: inherit;">` elements containing **new** text nodes.
 3. The original text nodes are removed from the document — but React still owns and references them.
-4. Translation can also delete text nodes outright and reorder inline elements to match target-language word order ([Chromium bug 872770](https://issues.chromium.org/issues/41410214)).
+4. Translation can also delete text nodes outright and reorder inline elements to match target-language word order ([Chromium bug 872770](https://issues.chromium.org/issues/41407169)).
 
 React keeps operating on the original, now-detached nodes:
 
