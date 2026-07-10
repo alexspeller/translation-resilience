@@ -95,6 +95,17 @@ Where the cost comes from: one document-wide `MutationObserver` (childList + cha
 
 While translation **is** active, each update to translated text pays the restore → re-translate cycle: ≈ 14 µs per updated text run, so a commit updating 1,500 translated text runs at once costs ≈ 20 ms extra. The alternative without the shim is those updates never becoming visible at all. Translated pages that are idle cost nothing beyond the observer.
 
+### How React core could fix this (nearly for free)
+
+Almost everything this package pays on the happy path is an *outsider tax*: the cost of reconstructing, from mutation records, knowledge the renderer already has. React knows which text nodes it owns (each HostText fiber holds its DOM node), what they should contain (`memoizedProps`), and what the DOM around them should look like (the fiber tree). A fix inside React would need none of this package's machinery:
+
+- **Detection is one pointer comparison.** A text node displaced by translation has `parentNode === null`, so the silent-freeze case is caught by a single check inside `commitTextUpdate`, on an operation React is already performing — instead of a document-wide `MutationObserver` allocating a record (plus an `oldValue` string copy) for every DOM mutation on the page.
+- **The crash half can cost literally nothing.** React 19 already wraps commit-phase deletions in try/catch — that is why it tears down to the nearest error boundary instead of white-screening. Upgrading that catch from "tear down" to "repair and continue" adds zero instructions to the non-throwing path.
+- **Repair needs no archaeology.** This package tracks displacement groups through a correlation window because, from the outside, "which foreign nodes replaced mine, and what did mine say?" can only be answered by watching the mutations happen. React can instead rebuild the affected host element's children from fiber state — the moral equivalent of hydration-mismatch recovery — and let the translator re-translate the result. Same self-healing loop as this shim, none of the bookkeeping.
+- **Nobody else pays.** The prototype patches here are page-global: every DOM user, React or not, pays the (small) toll. An in-core fix is scoped to React's own commit operations.
+
+Against the numbers above: the measured shim overhead (~0.3 ms on a full-table commit, +20% on mount/unmount cycles) would drop to a branch-predicted pointer compare — effectively unmeasurable. A fix has been requested since 2017 ([facebook/react#11538](https://github.com/facebook/react/issues/11538)); the traditional objections — defensive checks don't belong in the commit hot path, and third-party DOM mutation is outside React's contract — are worth weighing against what userland has to do instead, which is this entire package. The same reasoning applies to any renderer that keeps references to the text nodes it creates (Vue, Ember, Svelte). We would be delighted for this package to be made obsolete.
+
 ## Testing your app against translation: the simulator
 
 The package ships the mutation simulator used to test the shim itself — it reproduces Google Translate's exact DOM mutations (merge, segment-split, nested `<font>` wrappers, detached originals, deletions, word-order moves, and the ongoing re-translation observer) so you can write deterministic tests without a real browser translation session:
