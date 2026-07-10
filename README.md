@@ -8,7 +8,7 @@ import { installTranslationResilience } from 'translation-resilience';
 installTranslationResilience();
 ```
 
-Framework-agnostic (it patches the DOM layer, not React), dependency-free, ~2.3 kB min+gzip.
+Framework-agnostic (it patches the DOM layer, not React), dependency-free, ~2.4 kB min+gzip.
 
 ## The problem
 
@@ -82,9 +82,18 @@ installTranslationResilience({
 - **Reversible.** `installTranslationResilience()` returns an uninstall function that restores all prototypes and disconnects the observer. Calling install twice returns the same uninstall (idempotent).
 - **SSR-safe to import.** Native DOM entry points are captured lazily, so importing the module in Node is fine; only *calling* install requires a DOM.
 
-### Cost
+## Performance cost
 
-One document-wide `MutationObserver` (childList + characterData, subtree). Record processing is linear in the number of mutations with small constants, and correlation state expires after 100 ms, so steady-state memory is effectively zero. The prototype patches add one `parentNode` comparison to `removeChild`/`insertBefore`/`appendChild` calls on the happy path.
+Measured numbers, with an honest caveat up front: these are microbenchmarks from one machine (Apple Silicon, headless Chrome, production React 18 build; a 500-row × 4-column table, medians of 7 runs). The shim has **not yet been benchmarked inside a large production app** — if you measure something different, please open an issue.
+
+While translation is **not** active (the common case):
+
+- **React-level overhead is small.** Re-rendering the table with three cells changing in every row, 50 commits: 27 ms → 41 ms total, ≈ 0.3 ms extra per full-table commit. Repeated mount+unmount of the whole table: +20%.
+- **Per-operation costs are sub-microsecond.** Writes to an attached `text.data`: ~0.05 µs → ~0.3 µs each (setter indirection plus the observer allocating a characterData record). The worst case we could construct — a tight synchronous loop appending and removing individual detached text nodes, a pattern frameworks don't produce (they remove element subtrees as one operation) — costs ~1.8 µs per append+remove pair vs ~0.2 µs native.
+
+Where the cost comes from: one document-wide `MutationObserver` (childList + characterData + oldValue, subtree) means the browser allocates a record per DOM mutation. The patched methods add a parent check per call; inserting a *detached* text node additionally drains and processes pending observer records. Correlation state expires after 100 ms and is purged incrementally (amortized O(1) per entry), so steady-state memory is effectively zero.
+
+While translation **is** active, each update to translated text pays the restore → re-translate cycle: ≈ 14 µs per updated text run, so a commit updating 1,500 translated text runs at once costs ≈ 20 ms extra. The alternative without the shim is those updates never becoming visible at all. Translated pages that are idle cost nothing beyond the observer.
 
 ## Testing your app against translation: the simulator
 

@@ -1,6 +1,6 @@
 {
   "name": "translation-resilience",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Stops browser page translation (Google Translate) from crashing React and silently freezing translated text, by re-adopting displaced text nodes instead of swallowing errors.",
   "keywords": [
     "google-translate",

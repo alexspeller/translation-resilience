@@ -164,6 +164,16 @@ interface PendingOrphan {
   nextSibling: Node | null;
 }
 
+/**
+ * Every correlation store below is kept in ascending-`at` order: new entries
+ * are appended, and any refresh of an existing entry's timestamp must
+ * delete-then-set so the entry moves to the end. purgeExpired relies on this
+ * to drop only the expired prefix and stop at the first fresh entry —
+ * processRecords runs on every synchronous drain (i.e. inside patched DOM
+ * calls), so a full scan of the stores per drain is quadratic under heavy
+ * synchronous DOM churn.
+ */
+
 /** Nodes recently inserted, indexed by their at-insertion-time nextSibling. */
 const recentInsertedBefore = new Map<Node, TimedRun>();
 /** First recently-seen characterData oldValue per node = value before the mutation sequence. */
@@ -175,15 +185,23 @@ let pendingOrphans: PendingOrphan[] = [];
 
 function purgeExpired(now: number): void {
   for (const [key, entry] of recentInsertedBefore) {
-    if (now - entry.at > CORRELATION_WINDOW_MS) recentInsertedBefore.delete(key);
+    if (now - entry.at <= CORRELATION_WINDOW_MS) break;
+    recentInsertedBefore.delete(key);
   }
   for (const [key, entry] of recentOldValues) {
-    if (now - entry.at > CORRELATION_WINDOW_MS) recentOldValues.delete(key);
+    if (now - entry.at <= CORRELATION_WINDOW_MS) break;
+    recentOldValues.delete(key);
   }
   for (const [key, entry] of recentCarrierAccumulated) {
-    if (now - entry.at > CORRELATION_WINDOW_MS) recentCarrierAccumulated.delete(key);
+    if (now - entry.at <= CORRELATION_WINDOW_MS) break;
+    recentCarrierAccumulated.delete(key);
   }
-  pendingOrphans = pendingOrphans.filter((orphan) => now - orphan.at <= CORRELATION_WINDOW_MS);
+  const firstFresh = pendingOrphans.findIndex((orphan) => now - orphan.at <= CORRELATION_WINDOW_MS);
+  if (firstFresh === -1) {
+    if (pendingOrphans.length > 0) pendingOrphans = [];
+  } else if (firstFresh > 0) {
+    pendingOrphans = pendingOrphans.slice(firstFresh);
+  }
 }
 
 function clearCorrelationState(): void {
@@ -233,6 +251,8 @@ function mergeCarrierFor(removed: Text, record: MutationRecord, now: number): Te
   if (carrierOriginalValue === undefined) return null;
   const accumulated = (recentCarrierAccumulated.get(carrier)?.value ?? '') + snapshotValue(removed);
   if (!(carrier.nodeValue ?? '').startsWith(carrierOriginalValue + accumulated)) return null;
+  // delete-then-set keeps the store in ascending-`at` order (see purgeExpired)
+  recentCarrierAccumulated.delete(carrier);
   recentCarrierAccumulated.set(carrier, { at: now, value: accumulated });
   return carrier;
 }
@@ -340,6 +360,8 @@ function processRecords(records: MutationRecord[]): void {
           const entry = recentInsertedBefore.get(record.nextSibling) ?? { at: now, nodes: [] };
           entry.at = now;
           entry.nodes.push(added);
+          // delete-then-set keeps the store in ascending-`at` order (see purgeExpired)
+          recentInsertedBefore.delete(record.nextSibling);
           recentInsertedBefore.set(record.nextSibling, entry);
         }
       }
