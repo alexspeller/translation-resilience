@@ -8,7 +8,7 @@ import { installTranslationResilience } from 'translation-resilience';
 installTranslationResilience();
 ```
 
-Framework-agnostic (it patches the DOM layer, not React), dependency-free, ~2.4 kB min+gzip.
+Framework-agnostic (it patches the DOM layer, not React), dependency-free, ~2.6 kB min+gzip, and lazily activated — near-zero cost until a translator actually touches the page.
 
 ## The problem
 
@@ -65,11 +65,18 @@ installTranslationResilience({
   document,
 
   // Observability hook: called with a short message on every non-native
-  // path taken, e.g. 'translation activity detected',
+  // path taken, e.g. 'translation signal detected, observing document',
+  // 'translation activity detected',
   // 'removeChild: displaced text already gone, removal skipped'.
   onEvent: (message) => {
     Bugsnag.leaveBreadcrumb('translation-resilience', { message }, 'log');
   },
+
+  // Install the document-wide observer immediately instead of waiting for
+  // the translation signal on <html> (see "Performance cost"). Costs more
+  // on never-translated pages; covers hypothetical translators that
+  // displace text without marking the document first.
+  eager: false,
 });
 ```
 
@@ -77,23 +84,24 @@ installTranslationResilience({
 
 ## Safety properties
 
-- **Inert until translation happens.** Before any translation activity is detected, every operation behaves natively — including throwing `NotFoundError` on genuine `removeChild`/`insertBefore` bugs in your code. The shim does not mask real bugs.
+- **Inert until translation happens.** The document-wide observer isn't even created until the translator marks `<html>` (see "Performance cost"), and until translation activity is detected every operation behaves natively — including throwing `NotFoundError` on genuine `removeChild`/`insertBefore` bugs in your code. The shim does not mask real bugs.
 - **Fault-contained.** Every non-native code path runs inside a guard; an internal error in the shim falls back to stock browser behavior and reports through `onEvent` (`internal error in …`). A bug in the shim can never make things worse than not having it.
 - **Reversible.** `installTranslationResilience()` returns an uninstall function that restores all prototypes and disconnects the observer. Calling install twice returns the same uninstall (idempotent).
 - **SSR-safe to import.** Native DOM entry points are captured lazily, so importing the module in Node is fine; only *calling* install requires a DOM.
 
 ## Performance cost
 
-Measured numbers, with an honest caveat up front: these are microbenchmarks from one machine (Apple Silicon, headless Chrome, production React 18 build; a 500-row × 4-column table, medians of 7 runs). The shim has **not yet been benchmarked inside a large production app** — if you measure something different, please open an issue.
+The shim is **lazily activated**. At install it patches the DOM methods and watches exactly one thing: the `lang` and `class` attributes of `<html>`. Chrome's translator announces itself there — it adds a `translated-ltr`/`translated-rtl` class and flips `lang` — a few hundred milliseconds *before* it touches any text (~275–500 ms measured against real Chrome). Only on that signal does the shim create the document-wide `MutationObserver` that does the real work. The class *value* is checked (`translated-…`), not merely "class changed", because browser extensions routinely add unrelated classes to `<html>`. Installing on an already-marked document activates immediately, and a synchronous fallback in the patched methods covers same-realm translators (like the bundled simulator) that signal and displace in the same task. A translator that displaces text without marking the document first would leave the shim dormant — stock browser behavior, never worse than not having it (`eager: true` trades the idle cost away to cover that hypothetical).
 
-While translation is **not** active (the common case):
+Measured numbers, with an honest caveat: these are microbenchmarks from one machine (Apple Silicon, headless Chrome, production React 18 build; a 500-row × 4-column table, medians of 7 runs). The shim has **not yet been benchmarked inside a large production app** — if you measure something different, please open an issue.
 
-- **React-level overhead is small.** Re-rendering the table with three cells changing in every row, 50 commits: 27 ms → 41 ms total, ≈ 0.3 ms extra per full-table commit. Repeated mount+unmount of the whole table: +20%.
-- **Per-operation costs are sub-microsecond.** Writes to an attached `text.data`: ~0.05 µs → ~0.3 µs each (setter indirection plus the observer allocating a characterData record). The worst case we could construct — a tight synchronous loop appending and removing individual detached text nodes, a pattern frameworks don't produce (they remove element subtrees as one operation) — costs ~1.8 µs per append+remove pair vs ~0.2 µs native.
+**Before any translation signal (the overwhelmingly common case) the cost is near zero:**
 
-Where the cost comes from: one document-wide `MutationObserver` (childList + characterData + oldValue, subtree) means the browser allocates a record per DOM mutation. The patched methods add a parent check per call; inserting a *detached* text node additionally drains and processes pending observer records. Correlation state expires after 100 ms and is purged incrementally (amortized O(1) per entry), so steady-state memory is effectively zero.
+- Re-rendering the table with three cells changing in every row, 50 commits: 26.9 ms → 29.1 ms (+8%, ≈ 40 µs per full-table commit). Repeated mount+unmount of the whole table: +3% (noise).
+- Writes to an attached `text.data`: ~0.05 µs → ~0.08 µs each. The worst case we could construct — a tight synchronous loop appending and removing individual detached text nodes, a pattern frameworks don't produce — ~0.2 µs → ~0.26 µs per pair.
+- What remains is the patched-method call indirection plus one attribute read per operation while dormant. There is no observer, so the browser allocates no mutation records.
 
-While translation **is** active, each update to translated text pays the restore → re-translate cycle: ≈ 14 µs per updated text run, so a commit updating 1,500 translated text runs at once costs ≈ 20 ms extra. The alternative without the shim is those updates never becoming visible at all. Translated pages that are idle cost nothing beyond the observer.
+**After translation starts**, the full machinery is live: one document-wide `MutationObserver` (childList + characterData + oldValue, subtree) means a record per DOM mutation, and inserting a *detached* text node drains and processes pending records. Correlation state expires after 100 ms and is purged incrementally (amortized O(1) per entry), so steady-state memory is effectively zero. On a translated page, operations on *untranslated* content cost roughly: ≈ 0.3 ms per pathological full-table commit, ~0.3 µs per text write, ~1.8 µs per worst-case churn op. Updates to *translated* text pay the restore → re-translate cycle: ≈ 14 µs per updated text run, so a commit updating 1,500 translated runs at once costs ≈ 20 ms extra — the alternative without the shim is those updates never becoming visible at all. Translated pages that are idle cost nothing beyond the observer.
 
 ### How React core could fix this (nearly for free)
 
@@ -104,7 +112,7 @@ Almost everything this package pays on the happy path is an *outsider tax*: the 
 - **Repair needs no archaeology.** This package tracks displacement groups through a correlation window because, from the outside, "which foreign nodes replaced mine, and what did mine say?" can only be answered by watching the mutations happen. React can instead rebuild the affected host element's children from fiber state — the moral equivalent of hydration-mismatch recovery — and let the translator re-translate the result. Same self-healing loop as this shim, none of the bookkeeping.
 - **Nobody else pays.** The prototype patches here are page-global: every DOM user, React or not, pays the (small) toll. An in-core fix is scoped to React's own commit operations.
 
-Against the numbers above: the measured shim overhead (~0.3 ms on a full-table commit, +20% on mount/unmount cycles) would drop to a branch-predicted pointer compare — effectively unmeasurable. A fix has been requested since 2017 ([facebook/react#11538](https://github.com/facebook/react/issues/11538)); the traditional objections — defensive checks don't belong in the commit hot path, and third-party DOM mutation is outside React's contract — are worth weighing against what userland has to do instead, which is this entire package. The same reasoning applies to any renderer that keeps references to the text nodes it creates (Vue, Ember, Svelte). We would be delighted for this package to be made obsolete.
+Against the numbers above: lazy activation already makes the never-translated case nearly free, but once translation is active the userland machinery has real costs that an in-core fix would not — and even the dormant-state residue (patched-call indirection, an attribute read per op) would drop to a branch-predicted pointer compare. A fix has been requested since 2017 ([facebook/react#11538](https://github.com/facebook/react/issues/11538)); the traditional objections — defensive checks don't belong in the commit hot path, and third-party DOM mutation is outside React's contract — are worth weighing against what userland has to do instead, which is this entire package. The same reasoning applies to any renderer that keeps references to the text nodes it creates (Vue, Ember, Svelte). We would be delighted for this package to be made obsolete.
 
 ## Testing your app against translation: the simulator
 
@@ -131,6 +139,8 @@ it('keeps counters updating on translated pages', async () => {
 ```
 
 `translateSubtree(root, translate?, options?)` performs the initial translation pass (the default `translate` wraps text as `[text]` so assertions are easy); `options` can simulate the nastier behaviors: `deleteTextNodes` (translation dropping nodes) and `moveToParentEnd` (word-order element moves). `startTranslateObserver(root)` keeps re-translating changed content, like the real thing.
+
+Like real Chrome, `translateSubtree` marks the document before touching any text — it adds `translated-ltr` and flips `lang` on `<html>` (that's what activates the lazily-installed shim). Remember to reset those attributes between tests if your assertions depend on them.
 
 ## Compatibility and limitations
 

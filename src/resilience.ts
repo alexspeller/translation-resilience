@@ -63,6 +63,9 @@ const groupByReplacementNode = new WeakMap<Node, DisplacementGroup>();
 const pendingCarrierOriginals = new WeakMap<Text, DisplacedOriginal[]>();
 
 let observer: MutationObserver | null = null;
+let sentinelObserver: MutationObserver | null = null;
+/** True while installed but not yet observing — patched methods run a cheap synchronous signal check. */
+let sentinelActive = false;
 let translationDetected = false;
 const noopEvent = (_message: string): void => undefined;
 let emitEvent: (message: string) => void = noopEvent;
@@ -459,6 +462,24 @@ export interface TranslationResilienceOptions {
   document?: Document;
   /** Observability hook: called with a short message on every non-native path taken. */
   onEvent?: (message: string) => void;
+  /**
+   * Install the document-wide observer immediately instead of waiting for a
+   * translation signal on <html>. The lazy default costs nothing until
+   * translation starts; eager also covers hypothetical translators that
+   * displace text without marking the document first.
+   */
+  eager?: boolean;
+}
+
+/**
+ * Chrome's translator marks the document before it displaces any text: it
+ * adds a `translated-ltr`/`translated-rtl` class and flips `lang` on <html>,
+ * measured ~275-500ms ahead of the first text mutation in real Chrome. The
+ * class VALUE is checked (not just "class changed") because extensions add
+ * unrelated classes to <html> on ordinary page loads.
+ */
+function hasTranslatedClass(doc: Document): boolean {
+  return doc.documentElement.className.includes('translated-');
 }
 
 export function installTranslationResilience(options: TranslationResilienceOptions = {}): () => void {
@@ -467,12 +488,54 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   const doc = options.document ?? document;
   emitEvent = options.onEvent ?? noopEvent;
 
-  observer = new MutationObserver((records) => {
-    guarded('record processing', () => processRecords(records), undefined);
-  });
-  observer.observe(doc, { childList: true, subtree: true, characterData: true, characterDataOldValue: true });
+  const activateObserver = (): void => {
+    if (observer) return;
+    sentinelActive = false;
+    sentinelObserver?.disconnect();
+    sentinelObserver = null;
+    observer = new MutationObserver((records) => {
+      guarded('record processing', () => processRecords(records), undefined);
+    });
+    observer.observe(doc, { childList: true, subtree: true, characterData: true, characterDataOldValue: true });
+    emitEvent('translation signal detected, observing document');
+  };
+
+  /**
+   * Same-realm translators (the bundled simulator, or anything else calling
+   * the patched DOM methods directly) can displace text in the same task that
+   * sets the signal — before the sentinel's microtask callback runs. Real
+   * Chrome translation runs in an isolated world with a large gap between
+   * signal and displacement, so this synchronous fallback is only load
+   * bearing for same-realm use: it reads one attribute while dormant and
+   * costs a boolean check once active.
+   */
+  const sentinelSyncCheck = (): void => {
+    if (sentinelActive && hasTranslatedClass(doc)) activateObserver();
+  };
+
+  if (options.eager || hasTranslatedClass(doc)) {
+    activateObserver();
+  } else {
+    sentinelObserver = new MutationObserver((records) => {
+      guarded(
+        'sentinel processing',
+        () => {
+          for (const record of records) {
+            if (record.attributeName === 'lang' || hasTranslatedClass(doc)) {
+              activateObserver();
+              return;
+            }
+          }
+        },
+        undefined
+      );
+    });
+    sentinelObserver.observe(doc.documentElement, { attributes: true, attributeFilter: ['lang', 'class'] });
+    sentinelActive = true;
+  }
 
   Node.prototype.removeChild = function removeChild<T extends Node>(this: Node, child: T): T {
+    sentinelSyncCheck();
     if (child.parentNode !== this) {
       const outcome = guarded(
         'removeChild repair',
@@ -501,6 +564,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   };
 
   Node.prototype.insertBefore = function insertBefore<T extends Node>(this: Node, node: T, child: Node | null): T {
+    sentinelSyncCheck();
     if (node instanceof Text && node.parentNode === null) {
       guarded('insertBefore node repair', () => restoreDisplaced(node), 'untracked');
     }
@@ -527,6 +591,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   };
 
   Node.prototype.appendChild = function appendChild<T extends Node>(this: Node, node: T): T {
+    sentinelSyncCheck();
     if (node instanceof Text && node.parentNode === null) {
       guarded('appendChild repair', () => restoreDisplaced(node), 'untracked');
     }
@@ -545,6 +610,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
     enumerable: natives.nodeValueDescriptor.enumerable,
     get: natives.nodeValueDescriptor.get,
     set(this: Node, value: string | null) {
+      sentinelSyncCheck();
       natives.setNodeValue(this, value);
       restoreAfterWrite(this);
     },
@@ -555,6 +621,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
     enumerable: natives.dataDescriptor.enumerable,
     get: natives.dataDescriptor.get,
     set(this: CharacterData, value: string) {
+      sentinelSyncCheck();
       natives.setData(this, value);
       restoreAfterWrite(this);
     },
@@ -563,6 +630,9 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   uninstallCurrent = () => {
     observer?.disconnect();
     observer = null;
+    sentinelObserver?.disconnect();
+    sentinelObserver = null;
+    sentinelActive = false;
     translationDetected = false;
     emitEvent = noopEvent;
     clearCorrelationState();

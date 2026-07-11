@@ -58,6 +58,21 @@ function findTextNode(root: Node, value: string): Text | null {
 }
 
 describe('googleTranslate simulator fidelity', () => {
+  afterEach(() => {
+    document.documentElement.classList.remove('translated-ltr');
+    document.documentElement.removeAttribute('lang');
+  });
+
+  it('marks the document like Chrome does before touching any text', () => {
+    const { container } = render(<CounterCase count={4} />);
+    expect(document.documentElement.classList.contains('translated-ltr')).toBe(false);
+
+    translateSubtree(container);
+
+    expect(document.documentElement.classList.contains('translated-ltr')).toBe(true);
+    expect(document.documentElement.getAttribute('lang')).toBe('x-pseudo');
+  });
+
   it('replaces text nodes with nested font wrappers and detaches the originals', () => {
     const { container } = render(<CounterCase count={4} />);
     const original = findTextNode(container, '4');

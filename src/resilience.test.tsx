@@ -74,6 +74,8 @@ describe('installTranslationResilience', () => {
 
   afterEach(() => {
     uninstall();
+    document.documentElement.classList.remove('translated-ltr');
+    document.documentElement.removeAttribute('lang');
   });
 
   it('survives unmounting translated conditional text and removes its visible replacement', () => {
@@ -231,5 +233,130 @@ describe('installTranslationResilience', () => {
     expect(() => parent.insertBefore(document.createElement('span'), foreignRef)).toThrow();
     document.body.removeChild(parent);
     document.body.removeChild(foreignRef);
+  });
+});
+
+/** GT-style displacement of one text node, WITHOUT the document-level signals. */
+function displaceWithoutSignals(textNode: Text, impostor: string): void {
+  const parent = textNode.parentNode;
+  if (!parent) throw new Error('text node must be attached');
+  const outer = document.createElement('font');
+  outer.setAttribute('style', 'vertical-align: inherit;');
+  const inner = document.createElement('font');
+  inner.setAttribute('style', 'vertical-align: inherit;');
+  inner.appendChild(document.createTextNode(impostor));
+  outer.appendChild(inner);
+  parent.insertBefore(outer, textNode);
+  parent.removeChild(textNode);
+}
+
+describe('lazy activation', () => {
+  afterEach(() => {
+    document.documentElement.classList.remove('translated-ltr');
+    document.documentElement.removeAttribute('lang');
+  });
+
+  it('stays dormant for displacement that happens without any translation signal', async () => {
+    const uninstall = installTranslationResilience();
+    try {
+      const { container, rerender } = render(<CounterCase count={1} />);
+      const textNode = findTextNode(container, '1');
+      expect(textNode).not.toBeNull();
+      if (!textNode) return;
+
+      displaceWithoutSignals(textNode, 'uno');
+      await flushMicrotasks();
+      rerender(<CounterCase count={2} />);
+      await flushMicrotasks();
+
+      // No signal was given, so the shim must not have been watching: the
+      // update went to the detached node and the impostor stays visible.
+      expect(container.textContent).toContain('uno');
+      expect(container.textContent).not.toContain('2');
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('tracks the same displacement with eager: true', async () => {
+    const uninstall = installTranslationResilience({ eager: true });
+    try {
+      const { container, rerender } = render(<CounterCase count={1} />);
+      const textNode = findTextNode(container, '1');
+      expect(textNode).not.toBeNull();
+      if (!textNode) return;
+
+      displaceWithoutSignals(textNode, 'uno');
+      await flushMicrotasks();
+      rerender(<CounterCase count={2} />);
+      await flushMicrotasks();
+
+      expect(container.textContent).toContain('2');
+      expect(container.textContent).not.toContain('uno');
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('activates on a documentElement lang change alone', async () => {
+    const uninstall = installTranslationResilience();
+    try {
+      const { container, rerender } = render(<CounterCase count={1} />);
+      const textNode = findTextNode(container, '1');
+      expect(textNode).not.toBeNull();
+      if (!textNode) return;
+
+      document.documentElement.setAttribute('lang', 'fr');
+      await flushMicrotasks();
+      displaceWithoutSignals(textNode, 'un');
+      await flushMicrotasks();
+      rerender(<CounterCase count={2} />);
+      await flushMicrotasks();
+
+      expect(container.textContent).toContain('2');
+      expect(container.textContent).not.toContain('un');
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('activates synchronously when the translated class and displacement land in the same task', () => {
+    const uninstall = installTranslationResilience();
+    try {
+      const { container, rerender } = render(<CounterCase count={1} />);
+      const textNode = findTextNode(container, '1');
+      expect(textNode).not.toBeNull();
+      if (!textNode) return;
+
+      // No microtask between the signal and the displacement - the patched
+      // methods must pick the signal up synchronously, like the simulator.
+      document.documentElement.classList.add('translated-ltr');
+      displaceWithoutSignals(textNode, 'uno');
+      rerender(<CounterCase count={2} />);
+
+      expect(container.textContent).toContain('2');
+      expect(container.textContent).not.toContain('uno');
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('activates immediately when installed on an already-translated document', () => {
+    document.documentElement.classList.add('translated-ltr');
+    const uninstall = installTranslationResilience();
+    try {
+      const { container, rerender } = render(<CounterCase count={1} />);
+      const textNode = findTextNode(container, '1');
+      expect(textNode).not.toBeNull();
+      if (!textNode) return;
+
+      displaceWithoutSignals(textNode, 'uno');
+      rerender(<CounterCase count={2} />);
+
+      expect(container.textContent).toContain('2');
+      expect(container.textContent).not.toContain('uno');
+    } finally {
+      uninstall();
+    }
   });
 });

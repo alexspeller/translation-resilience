@@ -21,6 +21,10 @@
  *  5. Comment nodes are never touched.
  *  6. A MutationObserver keeps watching the page and translates content that
  *     appears or changes later.
+ *  7. BEFORE any text is touched, the document is marked: a `translated-ltr`
+ *     class and a `lang` flip on <html> (class first, then lang — verified
+ *     empirically against real Chrome, where both land ~275-500ms ahead of
+ *     the first displacement mutation).
  */
 
 export function pseudoTranslate(text: string): string {
@@ -132,12 +136,26 @@ function normalizeSubtree(root: Node): void {
   }
 }
 
+/**
+ * Marks the document the way Chrome's translator does before touching any
+ * text: a `translated-ltr` class and a `lang` flip on <html>. Emitting these
+ * first lets lazily-activating consumers (like translation-resilience
+ * itself) arm before displacement begins.
+ */
+function emitTranslationSignals(root: Node): void {
+  const doc = root.ownerDocument ?? (root instanceof Document ? root : document);
+  const html = doc.documentElement;
+  if (!html.classList.contains('translated-ltr')) html.classList.add('translated-ltr');
+  if (html.getAttribute('lang') !== 'x-pseudo') html.setAttribute('lang', 'x-pseudo');
+}
+
 /** One-shot translation pass over a subtree, like the initial page translate. */
 export function translateSubtree(
   root: Node,
   translate: TranslateFn = pseudoTranslate,
   options: TranslateOptions = {}
 ): void {
+  emitTranslationSignals(root);
   for (const textNode of options.deleteTextNodes ?? []) {
     textNode.parentNode?.removeChild(textNode);
   }
