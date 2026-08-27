@@ -127,11 +127,14 @@ function guarded<T>(operation: string, run: () => T, fallback: T): T {
   }
 }
 
+function markTranslationDetected(): void {
+  if (translationDetected) return;
+  translationDetected = true;
+  emitEvent('translation activity detected');
+}
+
 function registerGroup(group: DisplacementGroup): void {
-  if (!translationDetected) {
-    translationDetected = true;
-    emitEvent('translation activity detected');
-  }
+  markTranslationDetected();
   for (const original of group.originals) displaced.set(original.node, group);
   for (const node of group.replacement) groupByReplacementNode.set(node, group);
 }
@@ -217,6 +220,30 @@ function clearCorrelationState(): void {
 /** Replacement nodes a translator produces: <font> wrappers or plain text (revert). */
 function looksLikeTranslatorReplacement(node: Node): boolean {
   return node instanceof Text || node.nodeName === 'FONT';
+}
+
+/**
+ * Recognises the <font> wrapper a page translator specifically emits — not a
+ * <font> an app happens to render itself. <font> is deprecated but apps can
+ * still produce one (JSX, dangerouslySetInnerHTML, rendered HTML/markdown), so
+ * the tag alone is not enough; we match the translator's signature:
+ *
+ *  - Chrome's Google Translate (built-in and the browser extension) wraps text
+ *    in `<font style="vertical-align: inherit;">` (doubly nested).
+ *  - Microsoft Edge's built-in translator wraps in `<font>` carrying
+ *    `_msttexthash` / `_msthash` / `_mstmutation` attributes and no style.
+ *
+ * Matching the signature keeps an app's own <font> from arming the observer,
+ * while still covering translators that never mark <html>.
+ */
+function isTranslatorFontWrapper(node: Node): boolean {
+  if (node.nodeName !== 'FONT' || !(node instanceof HTMLElement)) return false;
+  return (
+    node.style.verticalAlign === 'inherit' ||
+    node.hasAttribute('_msttexthash') ||
+    node.hasAttribute('_msthash') ||
+    node.hasAttribute('_mstmutation')
+  );
 }
 
 /**
@@ -524,16 +551,20 @@ export function installTranslationResilience(options: TranslationResilienceOptio
    * or flipping lang — so the attribute sentinel never fires and the shim would
    * stay dormant while the page is actively being translated, letting the
    * renderer crash exactly as it would with no shim (reported in production on
-   * Edge). A <font> element entering the observed tree is itself an
-   * unambiguous translator signal — React and other renderers never emit
-   * <font> — so arm on it too. Called before the native insertion runs, so the
-   * observer is watching in time to record this very displacement. The cost
-   * while dormant is one nodeName comparison per insert, and it short-circuits
-   * once observing — far cheaper than running the full observer eagerly for the
-   * whole page lifetime.
+   * Edge). A <font> carrying a translator's signature (isTranslatorFontWrapper)
+   * entering the tree is an unambiguous translation signal, so arm on it too.
+   * Called before the native insertion runs, so the observer is watching in
+   * time to record this very displacement; and translationDetected is set
+   * directly, so the crash-avoidance paths engage even for a translator whose
+   * mutation shape the observer does not recognise as a displacement group
+   * (Edge structures its wrapping differently from Chrome). The cost while
+   * dormant is a nodeName comparison per insert — far cheaper than running the
+   * full observer eagerly for the whole page lifetime.
    */
   const noticeTranslatorFont = (inserted: Node): void => {
-    if (sentinelActive && inserted.nodeName === 'FONT') activateObserver();
+    if (translationDetected || !isTranslatorFontWrapper(inserted)) return;
+    activateObserver();
+    markTranslationDetected();
   };
 
   if (options.eager || hasTranslatedClass(doc)) {
