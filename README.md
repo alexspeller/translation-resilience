@@ -72,10 +72,12 @@ installTranslationResilience({
     Bugsnag.leaveBreadcrumb('translation-resilience', { message }, 'log');
   },
 
-  // Install the document-wide observer immediately instead of waiting for
-  // the translation signal on <html> (see "Performance cost"). Costs more
-  // on never-translated pages; covers hypothetical translators that
-  // displace text without marking the document first.
+  // Install the document-wide observer immediately instead of waiting for a
+  // translation signal (see "Performance cost"). Costs more on never-translated
+  // pages. Rarely needed: lazy activation already covers translators that mark
+  // <html> (Chrome) AND translators that only wrap text in <font> (Edge, the
+  // Google Translate extension). eager is the escape hatch for a translator
+  // that would displace text without even inserting a <font> wrapper.
   eager: false,
 });
 ```
@@ -84,14 +86,19 @@ installTranslationResilience({
 
 ## Safety properties
 
-- **Inert until translation happens.** The document-wide observer isn't even created until the translator marks `<html>` (see "Performance cost"), and until translation activity is detected every operation behaves natively — including throwing `NotFoundError` on genuine `removeChild`/`insertBefore` bugs in your code. The shim does not mask real bugs.
+- **Inert until translation happens.** The document-wide observer isn't even created until a translation signal appears — the translator marking `<html>`, or its first `<font>` wrapper entering the tree (see "Performance cost") — and until translation activity is detected every operation behaves natively, including throwing `NotFoundError` on genuine `removeChild`/`insertBefore` bugs in your code. The shim does not mask real bugs.
 - **Fault-contained.** Every non-native code path runs inside a guard; an internal error in the shim falls back to stock browser behavior and reports through `onEvent` (`internal error in …`). A bug in the shim can never make things worse than not having it.
 - **Reversible.** `installTranslationResilience()` returns an uninstall function that restores all prototypes and disconnects the observer. Calling install twice returns the same uninstall (idempotent).
 - **SSR-safe to import.** Native DOM entry points are captured lazily, so importing the module in Node is fine; only *calling* install requires a DOM.
 
 ## Performance cost
 
-The shim is **lazily activated**. At install it patches the DOM methods and watches exactly one thing: the `lang` and `class` attributes of `<html>`. Chrome's translator announces itself there — it adds a `translated-ltr`/`translated-rtl` class and flips `lang` — a few hundred milliseconds *before* it touches any text (~275–500 ms measured against real Chrome). Only on that signal does the shim create the document-wide `MutationObserver` that does the real work. The class *value* is checked (`translated-…`), not merely "class changed", because browser extensions routinely add unrelated classes to `<html>`. Installing on an already-marked document activates immediately, and a synchronous fallback in the patched methods covers same-realm translators (like the bundled simulator) that signal and displace in the same task. A translator that displaces text without marking the document first would leave the shim dormant — stock browser behavior, never worse than not having it (`eager: true` trades the idle cost away to cover that hypothetical).
+The shim is **lazily activated**. At install it patches the DOM methods and watches for two kinds of signal, whichever comes first:
+
+- **`<html>` markers.** It watches the `lang` and `class` attributes of `<html>`. Chrome's built-in translator announces itself there — it adds a `translated-ltr`/`translated-rtl` class and flips `lang` — a few hundred milliseconds *before* it touches any text (~275–500 ms measured against real Chrome). The class *value* is checked (`translated-…`), not merely "class changed", because browser extensions routinely add unrelated classes to `<html>`.
+- **The translator's own `<font>` wrappers.** Not every translator marks `<html>`: Microsoft Edge's built-in translator and the Google Translate browser extension wrap text in `<font>` elements without ever touching the class or `lang`. The patched `insertBefore`/`appendChild` recognise a translator's *signature* `<font>` entering the tree — `style="vertical-align: inherit;"` (Google) or the `_msttexthash`/`_msthash`/`_mstmutation` attributes (Edge) — and arm on it, in time to record that same displacement. Matching the signature rather than the bare tag matters because `<font>` is deprecated but not impossible for an app to render itself (via JSX, `dangerouslySetInnerHTML`, or rendered HTML/markdown); an app's own `<font>` has neither marker and is ignored. While dormant this is a `nodeName` comparison per insert.
+
+Only on a signal does the shim create the document-wide `MutationObserver` that does the real work. Installing on an already-marked document activates immediately, and a synchronous fallback in the patched methods covers same-realm translators (like the bundled simulator) that signal and displace in the same task. The remaining gap — a translator that displaces text without marking `<html>` *and* without an identifiable `<font>` wrapper — is covered by `eager: true`, which trades the idle cost away.
 
 Measured numbers, with an honest caveat: these are microbenchmarks from one machine (Apple Silicon, headless Chrome, production React 18 build; a 500-row × 4-column table, medians of 7 runs). The shim has **not yet been benchmarked inside a large production app** — if you measure something different, please open an issue.
 
@@ -145,7 +152,7 @@ Like real Chrome, `translateSubtree` marks the document before touching any text
 ## Compatibility and limitations
 
 - **Renderers**: developed and tested against React 18 (the tests render real components with `react-dom` and assert both crash-avoidance and update-visibility). React 19 benefits equally — its error-boundary teardown and the silent freeze both disappear. The patch layer is framework-agnostic, so Vue/Svelte/Ember apps should benefit too, but the test suite currently covers React.
-- **Translators**: built against Chrome's translation mutations (the merge/wrap/remove pattern, `<font>` wrappers). A translator that mutates differently simply isn't recognized — unrecognized mutations degrade to stock behavior, never worse than not having the shim.
+- **Translators**: built against Chrome's translation mutations (the merge/wrap/remove pattern, `<font>` wrappers). Covers both translators that mark `<html>` (Chrome's built-in Google Translate) and translators that only wrap text in `<font>` (Microsoft Edge's built-in translator, the Google Translate browser extension). A translator that mutates in some entirely different way simply isn't recognized — unrecognized mutations degrade to stock behavior, never worse than not having the shim (and `eager: true` widens coverage further).
 - **`event.target` inside translated text is a `<font>` element.** That's inherent to page translation, not this shim. React's synthetic event dispatch is unaffected (handlers fire on the right components with the right `currentTarget`), but avoid comparing `event.target` by identity or tag — use `closest()`/`contains()`.
 - **Word-order moves are cosmetically imperfect**: text the translator deleted for a word-order change is restored at the best position still known, which may differ from the translator's chosen ordering until re-translation catches up.
 - **Same-realm only**: iframes have their own prototypes and documents; install the shim inside each frame that renders your app.
