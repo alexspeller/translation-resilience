@@ -464,9 +464,12 @@ export interface TranslationResilienceOptions {
   onEvent?: (message: string) => void;
   /**
    * Install the document-wide observer immediately instead of waiting for a
-   * translation signal on <html>. The lazy default costs nothing until
-   * translation starts; eager also covers hypothetical translators that
-   * displace text without marking the document first.
+   * translation signal. The lazy default costs nothing until translation
+   * starts and now arms on the translator's own <font> wrappers (see
+   * noticeTranslatorFont), so it covers translators that never mark <html> —
+   * Edge's built-in translator, the Google Translate extension. eager remains
+   * as an escape hatch for a translator that would displace text without even
+   * inserting a recognizable <font> wrapper.
    */
   eager?: boolean;
 }
@@ -511,6 +514,26 @@ export function installTranslationResilience(options: TranslationResilienceOptio
    */
   const sentinelSyncCheck = (): void => {
     if (sentinelActive && hasTranslatedClass(doc)) activateObserver();
+  };
+
+  /**
+   * Not every translator marks <html> before it displaces text. Chrome's
+   * built-in Google Translate does (the class/lang signals above), but
+   * Microsoft Edge's built-in translator and the Google Translate browser
+   * extension wrap text in <font> elements WITHOUT adding a translated-* class
+   * or flipping lang — so the attribute sentinel never fires and the shim would
+   * stay dormant while the page is actively being translated, letting the
+   * renderer crash exactly as it would with no shim (reported in production on
+   * Edge). A <font> element entering the observed tree is itself an
+   * unambiguous translator signal — React and other renderers never emit
+   * <font> — so arm on it too. Called before the native insertion runs, so the
+   * observer is watching in time to record this very displacement. The cost
+   * while dormant is one nodeName comparison per insert, and it short-circuits
+   * once observing — far cheaper than running the full observer eagerly for the
+   * whole page lifetime.
+   */
+  const noticeTranslatorFont = (inserted: Node): void => {
+    if (sentinelActive && inserted.nodeName === 'FONT') activateObserver();
   };
 
   if (options.eager || hasTranslatedClass(doc)) {
@@ -565,6 +588,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
 
   Node.prototype.insertBefore = function insertBefore<T extends Node>(this: Node, node: T, child: Node | null): T {
     sentinelSyncCheck();
+    noticeTranslatorFont(node);
     if (node instanceof Text && node.parentNode === null) {
       guarded('insertBefore node repair', () => restoreDisplaced(node), 'untracked');
     }
@@ -592,6 +616,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
 
   Node.prototype.appendChild = function appendChild<T extends Node>(this: Node, node: T): T {
     sentinelSyncCheck();
+    noticeTranslatorFont(node);
     if (node instanceof Text && node.parentNode === null) {
       guarded('appendChild repair', () => restoreDisplaced(node), 'untracked');
     }

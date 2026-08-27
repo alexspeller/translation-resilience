@@ -236,8 +236,13 @@ describe('installTranslationResilience', () => {
   });
 });
 
-/** GT-style displacement of one text node, WITHOUT the document-level signals. */
-function displaceWithoutSignals(textNode: Text, impostor: string): void {
+/**
+ * GT-style displacement of one text node WITHOUT the document-level class/lang
+ * signals — the translator only wraps the text in <font> and detaches the
+ * original. This is how Microsoft Edge's built-in translator and the Google
+ * Translate browser extension behave (they never mark <html>).
+ */
+function displaceViaFontOnly(textNode: Text, impostor: string): void {
   const parent = textNode.parentNode;
   if (!parent) throw new Error('text node must be attached');
   const outer = document.createElement('font');
@@ -256,7 +261,7 @@ describe('lazy activation', () => {
     document.documentElement.removeAttribute('lang');
   });
 
-  it('stays dormant for displacement that happens without any translation signal', async () => {
+  it("arms on the translator's <font> wrappers even with no class or lang signal", async () => {
     const uninstall = installTranslationResilience();
     try {
       const { container, rerender } = render(<CounterCase count={1} />);
@@ -264,15 +269,58 @@ describe('lazy activation', () => {
       expect(textNode).not.toBeNull();
       if (!textNode) return;
 
-      displaceWithoutSignals(textNode, 'uno');
+      // No class/lang signal — only <font> wrappers, like Edge / the GT
+      // extension. The inserted <font> is the signal that arms the observer.
+      displaceViaFontOnly(textNode, 'uno');
       await flushMicrotasks();
       rerender(<CounterCase count={2} />);
       await flushMicrotasks();
 
-      // No signal was given, so the shim must not have been watching: the
-      // update went to the detached node and the impostor stays visible.
-      expect(container.textContent).toContain('uno');
-      expect(container.textContent).not.toContain('2');
+      // The update reaches the visible DOM and the impostor is gone.
+      expect(container.textContent).toContain('2');
+      expect(container.textContent).not.toContain('uno');
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('survives React inserting an element before <font>-displaced text (no class/lang signal)', async () => {
+    const uninstall = installTranslationResilience();
+    try {
+      const { container, rerender } = render(<InsertionCase show={false} />);
+      const trailing = findTextNode(container, 'trailing text');
+      expect(trailing).not.toBeNull();
+      if (!trailing) return;
+
+      // Edge wraps the trailing text in <font> and detaches the original.
+      displaceViaFontOnly(trailing, '[trailing text]');
+      await flushMicrotasks();
+
+      // Mounting <em> makes React insertBefore(em, trailing); trailing is now
+      // detached. This is the production NotFoundError (reported on Edge) — the
+      // shim must have armed on the <font> and restore the reference instead.
+      expect(() => rerender(<InsertionCase show />)).not.toThrow();
+      expect(container.querySelector('em')).not.toBeNull();
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('stays dormant when nothing that looks like translation happens', async () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ onEvent: (message) => events.push(message) });
+    try {
+      const { container, rerender } = render(<CounterCase count={1} />);
+      // Ordinary React churn — no <font>, no class, no lang — must not arm the
+      // observer, so genuine bugs keep throwing and idle cost stays near zero.
+      rerender(<CounterCase count={2} />);
+      await flushMicrotasks();
+      rerender(<CounterCase count={3} />);
+      await flushMicrotasks();
+
+      expect(container.textContent).toContain('3');
+      expect(events).not.toContain('translation signal detected, observing document');
+      expect(events).not.toContain('translation activity detected');
     } finally {
       uninstall();
     }
@@ -286,7 +334,7 @@ describe('lazy activation', () => {
       expect(textNode).not.toBeNull();
       if (!textNode) return;
 
-      displaceWithoutSignals(textNode, 'uno');
+      displaceViaFontOnly(textNode, 'uno');
       await flushMicrotasks();
       rerender(<CounterCase count={2} />);
       await flushMicrotasks();
@@ -308,7 +356,7 @@ describe('lazy activation', () => {
 
       document.documentElement.setAttribute('lang', 'fr');
       await flushMicrotasks();
-      displaceWithoutSignals(textNode, 'un');
+      displaceViaFontOnly(textNode, 'un');
       await flushMicrotasks();
       rerender(<CounterCase count={2} />);
       await flushMicrotasks();
@@ -331,7 +379,7 @@ describe('lazy activation', () => {
       // No microtask between the signal and the displacement - the patched
       // methods must pick the signal up synchronously, like the simulator.
       document.documentElement.classList.add('translated-ltr');
-      displaceWithoutSignals(textNode, 'uno');
+      displaceViaFontOnly(textNode, 'uno');
       rerender(<CounterCase count={2} />);
 
       expect(container.textContent).toContain('2');
@@ -350,7 +398,7 @@ describe('lazy activation', () => {
       expect(textNode).not.toBeNull();
       if (!textNode) return;
 
-      displaceWithoutSignals(textNode, 'uno');
+      displaceViaFontOnly(textNode, 'uno');
       rerender(<CounterCase count={2} />);
 
       expect(container.textContent).toContain('2');
