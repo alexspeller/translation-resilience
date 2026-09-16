@@ -217,3 +217,81 @@ export function startTranslateObserver(root: Node, translate: TranslateFn = pseu
   observer.observe(root, { childList: true, subtree: true, characterData: true });
   return () => observer.disconnect();
 }
+
+/**
+ * Native DOM entry points, captured when this module is first imported — that
+ * is, before `installTranslationResilience` patches `Node.prototype`.
+ *
+ * A real page translator (Chrome's, Edge's, the Google Translate extension)
+ * runs in the browser engine's own *isolated world*: it shares the DOM but
+ * holds a separate copy of `Node.prototype`, so none of the shim's patched
+ * methods ever observe its mutations. Calling these captured natives
+ * reproduces exactly that constraint inside a single realm.
+ *
+ * This distinction decides whether a test is meaningful. A simulator that
+ * displaces text through the live prototype methods arms the shim through a
+ * path no real translator can reach, so it passes whether or not the shim
+ * would survive a real translation — which is how a whole class of production
+ * crash stayed green in CI. Displace through these instead.
+ */
+const nativeDom = {
+  insertBefore: Node.prototype.insertBefore,
+  removeChild: Node.prototype.removeChild,
+  appendChild: Node.prototype.appendChild,
+};
+
+/** Which browser's wrapper markup to emit. */
+export type TranslatorSignature = 'google' | 'edge';
+
+/**
+ * Built entirely through the captured natives — including while assembling the
+ * wrapper off-document. Using the live `appendChild` here would call the
+ * shim's patched method with a signature <font>, arming it through the very
+ * path a real translator cannot reach, and the test would pass for the wrong
+ * reason.
+ */
+function createSignatureWrapper(translatedText: string, signature: TranslatorSignature): HTMLElement {
+  const translatedNode = document.createTextNode(translatedText);
+  simulatorOwnedTextNodes.add(translatedNode);
+
+  if (signature === 'google') {
+    // Chrome's translator and its extension: doubly nested
+    // <font style="vertical-align: inherit;">.
+    const outer = document.createElement('font');
+    outer.setAttribute('style', 'vertical-align: inherit;');
+    const inner = document.createElement('font');
+    inner.setAttribute('style', 'vertical-align: inherit;');
+    nativeDom.appendChild.call(inner, translatedNode);
+    nativeDom.appendChild.call(outer, inner);
+    return outer;
+  }
+
+  // Edge's built-in translator: a <font> carrying _msttexthash/_msthash and no
+  // style, and no `translated-*` class or `lang` flip on <html> at all.
+  const font = document.createElement('font');
+  font.setAttribute('_msttexthash', '27820');
+  font.setAttribute('_msthash', '1');
+  nativeDom.appendChild.call(font, translatedNode);
+  return font;
+}
+
+/**
+ * Displaces one text node the way a real translator does — wrapper in, original
+ * out — using only the captured natives, so the shim's patched methods never
+ * see the operation. This is the faithful reproduction of a browser
+ * translator; `translateSubtree` is the same mutation shape performed in-realm.
+ *
+ * Returns the wrapper now standing in for the original.
+ */
+export function displaceFromIsolatedWorld(
+  textNode: Text,
+  translatedText: string = pseudoTranslate(textNode.nodeValue ?? ''),
+  signature: TranslatorSignature = 'google'
+): HTMLElement {
+  const parent = textNode.parentNode;
+  if (!parent) throw new Error('displaceFromIsolatedWorld: text node must be attached');
+  const wrapper = createSignatureWrapper(translatedText, signature);
+  nativeDom.insertBefore.call(parent, wrapper, textNode);
+  nativeDom.removeChild.call(parent, textNode);
+  return wrapper;
+}

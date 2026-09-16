@@ -19,3 +19,6 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      # Covers what jsdom cannot: a translator in the browser's own isolated
+      # world, and the animationstart-based detection stylesheet.
+      - run: npm run test:browser

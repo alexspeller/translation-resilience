@@ -1,7 +1,7 @@
 import { render } from '@testing-library/react';
 
 import { installTranslationResilience } from './resilience';
-import { pseudoTranslate, startTranslateObserver, translateSubtree } from './simulator';
+import { displaceFromIsolatedWorld, pseudoTranslate, startTranslateObserver, translateSubtree } from './simulator';
 
 /** MutationObserver callbacks are delivered as microtasks; let them run. */
 async function flushMicrotasks() {
@@ -470,6 +470,133 @@ describe('lazy activation', () => {
 
       expect(container.textContent).toContain('2');
       expect(container.textContent).not.toContain('uno');
+    } finally {
+      uninstall();
+    }
+  });
+});
+
+/**
+ * The cases that matter most: a real browser translator runs in the engine's
+ * isolated world, so it never calls the patched DOM methods. Every test here
+ * displaces text through `displaceFromIsolatedWorld`, which uses natives
+ * captured before install — the only faithful way to model that from inside a
+ * single realm. Tests that displace in-realm arm the shim through a path no
+ * real translator can reach, and pass even when production crashes.
+ */
+describe('translators running outside the patched realm (real browsers)', () => {
+  afterEach(() => {
+    document.documentElement.classList.remove('translated-ltr');
+    document.documentElement.removeAttribute('lang');
+  });
+
+  it("survives mounting an element before text Edge's translator displaced", () => {
+    const uninstall = installTranslationResilience();
+    try {
+      const { container, rerender } = render(<InsertionCase show={false} />);
+      const trailing = findTextNode(container, 'trailing text');
+      expect(trailing).not.toBeNull();
+      if (!trailing) return;
+
+      displaceFromIsolatedWorld(trailing, 'nachlaufender Text', 'edge');
+
+      // React mounts <em> before the trailing text it still owns: that text is
+      // now detached, so the native call would throw NotFoundError.
+      expect(() => rerender(<InsertionCase show />)).not.toThrow();
+      expect(container.querySelector('em')).not.toBeNull();
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('survives mounting an element before text the Google Translate extension displaced', () => {
+    const uninstall = installTranslationResilience();
+    try {
+      const { container, rerender } = render(<InsertionCase show={false} />);
+      const trailing = findTextNode(container, 'trailing text');
+      if (!trailing) throw new Error('setup failed');
+
+      displaceFromIsolatedWorld(trailing, pseudoTranslate('trailing text'), 'google');
+
+      expect(() => rerender(<InsertionCase show />)).not.toThrow();
+      expect(container.querySelector('em')).not.toBeNull();
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('survives unmounting text an out-of-realm translator displaced', () => {
+    const uninstall = installTranslationResilience();
+    try {
+      const { container, rerender } = render(<RemovalCase show />);
+      const text = findTextNode(container, 'There are four lights!');
+      if (!text) throw new Error('setup failed');
+
+      displaceFromIsolatedWorld(text, 'Es gibt vier Lichter!', 'edge');
+
+      expect(() => rerender(<RemovalCase show={false} />)).not.toThrow();
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('reports that it recognised the translation rather than silently swallowing', () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ onEvent: (message) => events.push(message) });
+    try {
+      const { container, rerender } = render(<InsertionCase show={false} />);
+      const trailing = findTextNode(container, 'trailing text');
+      if (!trailing) throw new Error('setup failed');
+
+      displaceFromIsolatedWorld(trailing, 'nachlaufender Text', 'edge');
+      rerender(<InsertionCase show />);
+
+      expect(events).toContain('translation evidence found on repair path');
+      expect(events).toContain('translation activity detected');
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('still throws on a genuine insertBefore bug when no translator has touched the page', () => {
+    const uninstall = installTranslationResilience();
+    try {
+      const parent = document.createElement('div');
+      document.body.appendChild(parent);
+      const stranger = document.createTextNode('never attached here');
+
+      expect(() => parent.insertBefore(document.createElement('em'), stranger)).toThrow();
+      parent.remove();
+    } finally {
+      uninstall();
+    }
+  });
+});
+
+describe('restoring into a parent the caller did not ask about', () => {
+  afterEach(() => {
+    document.documentElement.classList.remove('translated-ltr');
+    document.documentElement.removeAttribute('lang');
+  });
+
+  it('does not throw when the restored reference lands under a different parent', async () => {
+    const uninstall = installTranslationResilience();
+    try {
+      const { container } = render(<InsertionCase show={false} />);
+      const trailing = findTextNode(container, 'trailing text');
+      if (!trailing) throw new Error('setup failed');
+
+      // Tracked displacement, so restoring the node succeeds — but it is
+      // restored under its own parent, not the one asked about below.
+      displaceViaEdgeFont(trailing, 'nachlaufender Text');
+      await flushMicrotasks();
+
+      const elsewhere = document.createElement('div');
+      document.body.appendChild(elsewhere);
+
+      expect(() => elsewhere.insertBefore(document.createElement('em'), trailing)).not.toThrow();
+      expect(elsewhere.querySelector('em')).not.toBeNull();
+      elsewhere.remove();
     } finally {
       uninstall();
     }
