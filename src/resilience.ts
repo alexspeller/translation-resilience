@@ -36,6 +36,24 @@
  *    detected, unrecoverable parent mismatches degrade to guarded best-effort
  *    operations instead of throwing.
  *
+ * Arming, and why it cannot rely on the patches above: a browser's page
+ * translator runs in the engine's own ISOLATED WORLD — it shares the DOM but
+ * holds a separate copy of Node.prototype (Chromium runs the translate script
+ * via ExecuteScriptInIsolatedWorld; see translate_agent.cc). None of the
+ * patched methods here ever observe a translator's own mutations, so every
+ * arming signal has to be one the shared DOM raises:
+ *
+ *  - Chrome's translator flips `lang` and adds a `translated-*` class on
+ *    <html> a few hundred ms before it touches text: an attribute sentinel
+ *    catches that, and attributes are shared across worlds.
+ *  - Edge's translator and the Google Translate extension mark nothing. For
+ *    those, a detection stylesheet (DETECTION_CSS) puts a CSS animation on the
+ *    translator's signature <font>, and `animationstart` fires whichever world
+ *    inserted it — at a fraction of the cost of observing the document.
+ *  - Whatever still slips through lands on a patched method that is about to
+ *    throw NotFoundError, where a document sweep (translationEvident) tells a
+ *    translated page from a genuine renderer bug.
+ *
  * Before any translation activity is detected, operations on untracked nodes
  * behave exactly as before — including throwing on genuine bugs.
  */
@@ -118,11 +136,15 @@ function domNatives(): DomNatives {
  * behavior: every non-native code path runs through this guard, and on an
  * internal error the caller falls back to the native operation.
  */
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function guarded<T>(operation: string, run: () => T, fallback: T): T {
   try {
     return run();
   } catch (error) {
-    emitEvent(`internal error in ${operation}: ${error instanceof Error ? error.message : String(error)}`);
+    emitEvent(`internal error in ${operation}: ${describeError(error)}`);
     return fallback;
   }
 }
@@ -244,6 +266,83 @@ function isTranslatorFontWrapper(node: Node): boolean {
     node.hasAttribute('_msthash') ||
     node.hasAttribute('_mstmutation')
   );
+}
+
+/**
+ * The CSS spelling of the same signature isTranslatorFontWrapper matches.
+ * Kept deliberately adjacent to it: both must describe the same wrappers.
+ */
+const TRANSLATOR_FONT_SELECTOR = 'font[_msttexthash],font[_msthash],font[_mstmutation],font[style*="vertical-align"]';
+
+const DETECTION_ANIMATION_NAME = 'translation-resilience-detect';
+
+/**
+ * A browser's page translator runs in the engine's own isolated world: it
+ * shares the DOM but has a separate copy of Node.prototype, so it never calls
+ * the patched methods in this module. Any signal that depends on those
+ * patches firing (see noticeTranslatorFont) can therefore only ever be raised
+ * by a same-realm translator such as the bundled simulator — never by Chrome,
+ * Edge or Firefox. Arming has to come from the shared DOM itself.
+ *
+ * A MutationObserver would see it, but observing childList across the whole
+ * document costs about what the full observer costs (+7.2% vs +9.5% on a
+ * 500x4 grid churn benchmark, headless Chrome, medians of 9 interleaved
+ * trials) — precisely the cost lazy activation exists to avoid. A CSS
+ * animation keyed to the translator's signature <font> costs the style engine
+ * one more selector on elements it is already matching, and raises
+ * `animationstart` when a matching element enters the tree from any world:
+ * +1.1% on the same benchmark.
+ *
+ * `!important` and the attribute-qualified selector keep a global
+ * `* { animation: none !important }` reset from silencing the hook.
+ */
+const DETECTION_CSS =
+  `@keyframes ${DETECTION_ANIMATION_NAME}{from{opacity:1}to{opacity:1}}` +
+  `${TRANSLATOR_FONT_SELECTOR}{animation-duration:1ms!important;animation-name:${DETECTION_ANIMATION_NAME}!important}`;
+
+/**
+ * Constructable stylesheets first: a `style-src 'self'` Content-Security-Policy
+ * blocks an injected <style> element outright (verified in Chrome), while
+ * adoptedStyleSheets is CSSOM and unaffected by it. The <style> fallback
+ * covers engines without constructable stylesheet support.
+ */
+function installDetectionStylesheet(doc: Document): () => void {
+  const view = doc.defaultView;
+  try {
+    if (view && typeof view.CSSStyleSheet === 'function' && Array.isArray(doc.adoptedStyleSheets)) {
+      const sheet = new view.CSSStyleSheet();
+      sheet.replaceSync(DETECTION_CSS);
+      doc.adoptedStyleSheets = [...doc.adoptedStyleSheets, sheet];
+      return () => {
+        doc.adoptedStyleSheets = doc.adoptedStyleSheets.filter((candidate) => candidate !== sheet);
+      };
+    }
+  } catch (error) {
+    emitEvent(`detection stylesheet: adoptedStyleSheets unusable (${describeError(error)})`);
+  }
+  try {
+    const style = doc.createElement('style');
+    style.textContent = DETECTION_CSS;
+    (doc.head ?? doc.documentElement).appendChild(style);
+    return () => style.remove();
+  } catch (error) {
+    // No detection stylesheet: the repair-path sweep still prevents the crash.
+    emitEvent(`detection stylesheet: not installed (${describeError(error)})`);
+    return () => undefined;
+  }
+}
+
+/**
+ * Whether the document currently holds a translator's signature <font>. Only
+ * ever called from a path that is otherwise about to throw, so a
+ * document-wide query is affordable there; it never runs on a healthy path.
+ */
+function documentShowsTranslation(doc: Document): boolean {
+  try {
+    return doc.querySelector(TRANSLATOR_FONT_SELECTOR) !== null;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -518,11 +617,15 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   const doc = options.document ?? document;
   emitEvent = options.onEvent ?? noopEvent;
 
+  let teardownDetection: () => void = () => undefined;
+
   const activateObserver = (): void => {
     if (observer) return;
     sentinelActive = false;
     sentinelObserver?.disconnect();
     sentinelObserver = null;
+    teardownDetection();
+    teardownDetection = () => undefined;
     observer = new MutationObserver((records) => {
       guarded('record processing', () => processRecords(records), undefined);
     });
@@ -567,6 +670,46 @@ export function installTranslationResilience(options: TranslationResilienceOptio
     markTranslationDetected();
   };
 
+  /**
+   * The signal that actually covers real browsers. The translator inserts its
+   * signature <font> from its own isolated world, which the patched methods
+   * above never see, but the shared DOM raises `animationstart` for it via
+   * DETECTION_CSS regardless of which world made the change.
+   */
+  const onDetectionAnimation = (event: AnimationEvent): void => {
+    if (event.animationName !== DETECTION_ANIMATION_NAME) return;
+    guarded(
+      'detection animation',
+      () => {
+        if (translationDetected) return;
+        emitEvent('translator font detected via detection stylesheet');
+        activateObserver();
+        markTranslationDetected();
+      },
+      undefined
+    );
+  };
+
+  /**
+   * Last line of defence, consulted only where the native call is about to
+   * throw NotFoundError. Two cases reach here even with the detection
+   * stylesheet installed: `animationstart` is delivered on the next style
+   * update, so a renderer commit in the same task as the displacement can
+   * still arrive first; and a translator that displaces text without emitting
+   * a recognisable <font> raises no animation at all. Sweeping the document
+   * for translator evidence at that point is what separates "a translator
+   * moved this node" from a genuine renderer bug — so the shim degrades
+   * gracefully on translated pages while still throwing on untranslated ones.
+   */
+  const translationEvident = (): boolean => {
+    if (translationDetected) return true;
+    if (!documentShowsTranslation(doc)) return false;
+    emitEvent('translation evidence found on repair path');
+    activateObserver();
+    markTranslationDetected();
+    return true;
+  };
+
   if (options.eager || hasTranslatedClass(doc)) {
     activateObserver();
   } else {
@@ -586,6 +729,12 @@ export function installTranslationResilience(options: TranslationResilienceOptio
     });
     sentinelObserver.observe(doc.documentElement, { attributes: true, attributeFilter: ['lang', 'class'] });
     sentinelActive = true;
+    const removeStylesheet = installDetectionStylesheet(doc);
+    doc.addEventListener('animationstart', onDetectionAnimation, true);
+    teardownDetection = () => {
+      removeStylesheet();
+      doc.removeEventListener('animationstart', onDetectionAnimation, true);
+    };
   }
 
   Node.prototype.removeChild = function removeChild<T extends Node>(this: Node, child: T): T {
@@ -600,9 +749,11 @@ export function installTranslationResilience(options: TranslationResilienceOptio
             emitEvent('removeChild: displaced text already gone, removal skipped');
             return 'handled';
           }
-          if (result === 'untracked' && translationDetected) {
-            // Translation moved this node somewhere we could not track (e.g. a
-            // word-order change). Remove it from wherever it actually is.
+          if (result === 'restored' && child.parentNode === this) return 'native';
+          if (translationEvident()) {
+            // Either translation moved this node somewhere we could not track
+            // (e.g. a word-order change), or restoring it put it back under a
+            // different parent. Remove it from wherever it actually is.
             emitEvent('removeChild: removing node from its actual parent');
             if (child.parentNode) natives.removeChild.call(child.parentNode, child);
             return 'handled';
@@ -628,9 +779,11 @@ export function installTranslationResilience(options: TranslationResilienceOptio
         'insertBefore reference repair',
         (): 'native' | 'handled' => {
           const result = child instanceof Text ? restoreDisplaced(child) : 'untracked';
-          if (result !== 'restored' && translationDetected) {
-            // The reference node is unrecoverable; appending keeps the new node
-            // in the right parent, which is the best position still guaranteed.
+          if (result === 'restored' && child.parentNode === this) return 'native';
+          if (translationEvident()) {
+            // The reference node is unrecoverable, or restoring it put it back
+            // under a different parent; appending keeps the new node in the
+            // right parent, which is the best position still guaranteed.
             emitEvent('insertBefore: reference gone, appending instead');
             natives.appendChild.call(this, node);
             return 'handled';
@@ -684,6 +837,8 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   });
 
   uninstallCurrent = () => {
+    teardownDetection();
+    teardownDetection = () => undefined;
     observer?.disconnect();
     observer = null;
     sentinelObserver?.disconnect();
