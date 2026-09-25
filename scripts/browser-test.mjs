@@ -223,26 +223,47 @@ try {
     const { evaluate } = await session();
     await evaluate(`document.documentElement.lang = 'de'; 1`);
     await new Promise((r) => setTimeout(r, 50));
-    await evaluate(`document.documentElement.setAttribute('lang', 'de'); document.documentElement.lang = 'fr'; 1`);
+    await evaluate(`(function () {
+      const html = document.documentElement;
+      html.setAttribute('lang', 'de');
+      html.lang = 'fr';
+      html.setAttributeNS(null, 'lang', 'it');
+      html.toggleAttribute('lang');
+      html.toggleAttribute('lang', true);
+      html.removeAttribute('lang');
+      html.setAttribute('LANG', 'es');
+      return 1;
+    })();`);
     await new Promise((r) => setTimeout(r, 400));
     check("stays dormant for an application's own <html lang> writes", await evaluate('window.__events'), []);
   }
 
   {
-    // Chrome's translator marks <html> from its isolated world before it
-    // touches any text: the class, then a rewrite of the page's existing lang.
+    // Chrome's translator adds its class from its isolated world, ahead of
+    // any text.
     const { evaluate, isolated } = await session();
     await evaluate(`document.documentElement.lang = 'de'; 1`);
-    await evaluate(
-      `document.documentElement.classList.add('translated-ltr'); document.documentElement.setAttribute('lang', 'en'); 1`,
-      isolated
-    );
+    await evaluate(`document.documentElement.classList.add('translated-ltr'); 1`, isolated);
     await new Promise((r) => setTimeout(r, 100));
     check(
       "arms on the translated-* class set from the translator's isolated world",
       await evaluate('window.__events'),
       ['translation signal detected, observing document']
     );
+  }
+
+  {
+    // Firefox's signal: <html lang> set by a translator from outside the
+    // page. A genuine isolated world never sees the page's own wrappers on
+    // <html>, which is what tells this write from the app's.
+    const { evaluate, isolated } = await session();
+    await evaluate(`document.documentElement.lang = 'en'; 1`);
+    await evaluate(`document.documentElement.lang = 'fr'; 1`, isolated);
+    await new Promise((r) => setTimeout(r, 100));
+    check('<html lang> set from an isolated world arms the observer', await evaluate('window.__events'), [
+      '<html lang> changed from outside the page',
+      'translation signal detected, observing document',
+    ]);
   }
 } finally {
   if (child.exitCode === null && child.signalCode === null) {

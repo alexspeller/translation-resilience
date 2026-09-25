@@ -1,6 +1,6 @@
 import { render } from '@testing-library/react';
 
-import { pseudoTranslate, translateSubtree } from './simulator';
+import { mergeLikeFirefox, pseudoTranslate, translateLikeFirefox, translateSubtree } from './simulator';
 
 /**
  * These tests verify the simulator faithfully reproduces the documented,
@@ -149,5 +149,123 @@ describe('googleTranslate simulator fidelity', () => {
     // ...but the visible DOM still shows the stale translated value.
     expect(container.textContent).toContain(pseudoTranslate('4'));
     expect(container.textContent).not.toContain('5');
+  });
+});
+
+function SentenceCase({ count }: { count: number }) {
+  return <div>There are {count} lights in the tower</div>;
+}
+
+function LinkSentenceCase({ word }: { word: string }) {
+  return (
+    <p>
+      This is a sentence <a href="#x">with a link</a> written {word}
+    </p>
+  );
+}
+
+function FlickerCase({ note }: { note: boolean }) {
+  return (
+    <div>
+      Status: {4} lights are burning{note && ' and one is flickering'}
+    </div>
+  );
+}
+
+function KeeperCase({ badge }: { badge: boolean }) {
+  return (
+    <div>
+      The keeper {badge && <em>chief</em>}
+      {' is '}
+      on duty tonight
+    </div>
+  );
+}
+
+/**
+ * Pinned to what real Firefox 153 does (mutation log recorded against a React
+ * 18 page): the element is emptied first to last, the first Text node of each
+ * run is reused to carry the run's whole translation, and the rest of the run
+ * is never re-appended.
+ */
+describe('Firefox simulator fidelity', () => {
+  afterEach(() => {
+    document.documentElement.removeAttribute('lang');
+  });
+
+  it('sets <html lang> to the target language before any text changes', async () => {
+    const { container } = render(<SentenceCase count={4} />);
+    const div = container.firstElementChild;
+    if (!div) throw new Error('setup failed');
+    const before = div.innerHTML;
+
+    const pending = translateLikeFirefox(div);
+    expect(document.documentElement.getAttribute('lang')).toBe('x-pseudo');
+    expect(div.innerHTML).toBe(before);
+    await pending;
+    expect(div.textContent).toBe(pseudoTranslate('There are 4 lights in the tower'));
+  });
+
+  it('empties the element first to last, then appends the reused and translated nodes', () => {
+    const { container } = render(<LinkSentenceCase word="today" />);
+    const p = container.firstElementChild;
+    if (!p) throw new Error('setup failed');
+    const [lead, link, written, word] = [...p.childNodes];
+    const records: MutationRecord[] = [];
+    const observer = new MutationObserver((batch) => records.push(...batch));
+    observer.observe(p, { childList: true, subtree: true, characterData: true });
+
+    mergeLikeFirefox(p);
+    records.push(...observer.takeRecords());
+    observer.disconnect();
+
+    const onP = records.filter((record) => record.target === p);
+    const removals = onP.filter((record) => record.removedNodes.length > 0);
+    expect(removals.map((record) => record.removedNodes[0])).toEqual([lead, link, written, word]);
+    expect(removals.every((record) => record.previousSibling === null)).toBe(true);
+    expect(removals[removals.length - 1]?.nextSibling).toBeNull();
+    const appends = onP.filter((record) => record.addedNodes.length > 0);
+    expect(appends.map((record) => record.addedNodes[0])).toEqual([lead, link, written]);
+    expect(appends.every((record) => record.nextSibling === null)).toBe(true);
+
+    expect([...p.childNodes]).toEqual([lead, link, written]);
+    expect(written?.textContent).toBe(pseudoTranslate(' written today'));
+    expect(word?.parentNode).toBeNull();
+  });
+
+  it('reproduces silent stale text: an interpolation merged into its run never updates', async () => {
+    const { container, rerender } = render(<SentenceCase count={4} />);
+    const div = container.firstElementChild;
+    if (!div) throw new Error('setup failed');
+    const count = findTextNode(div, '4');
+
+    await translateLikeFirefox(div);
+    rerender(<SentenceCase count={5} />);
+
+    expect(count?.nodeValue).toBe('5');
+    expect(count?.parentNode).toBeNull();
+    expect(div.textContent).toBe(pseudoTranslate('There are 4 lights in the tower'));
+  });
+
+  it('reproduces the removeChild NotFoundError when conditional text Firefox dropped unmounts', async () => {
+    const { container, rerender } = render(<FlickerCase note />);
+    const div = container.firstElementChild;
+    if (!div) throw new Error('setup failed');
+    await translateLikeFirefox(div);
+
+    const thrown = captureThrown(() => rerender(<FlickerCase note={false} />));
+    expect(thrown).toBeInstanceOf(DOMException);
+    expect(thrown).toHaveProperty('name', 'NotFoundError');
+  });
+
+  it('reproduces the insertBefore NotFoundError when mounting before text Firefox dropped', async () => {
+    const { container, rerender } = render(<KeeperCase badge={false} />);
+    const div = container.firstElementChild;
+    if (!div) throw new Error('setup failed');
+    await translateLikeFirefox(div);
+
+    const thrown = captureThrown(() => rerender(<KeeperCase badge />));
+    expect(thrown).toBeInstanceOf(DOMException);
+    expect(thrown).toHaveProperty('name', 'NotFoundError');
   });
 });

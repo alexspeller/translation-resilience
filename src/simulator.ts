@@ -234,10 +234,17 @@ export function startTranslateObserver(root: Node, translate: TranslateFn = pseu
  * would survive a real translation — which is how a whole class of production
  * crash stayed green in CI. Displace through these instead.
  */
+const nativeDataSetter = Object.getOwnPropertyDescriptor(CharacterData.prototype, 'data')?.set;
+
 const nativeDom = {
   insertBefore: Node.prototype.insertBefore,
   removeChild: Node.prototype.removeChild,
   appendChild: Node.prototype.appendChild,
+  setAttribute: Element.prototype.setAttribute,
+  setData(node: CharacterData, value: string): void {
+    if (!nativeDataSetter) throw new Error('simulator: CharacterData.prototype.data has no setter');
+    nativeDataSetter.call(node, value);
+  },
 };
 
 /** Which browser's wrapper markup to emit. */
@@ -294,4 +301,89 @@ export function displaceFromIsolatedWorld(
   nativeDom.insertBefore.call(parent, wrapper, textNode);
   nativeDom.removeChild.call(parent, textNode);
   return wrapper;
+}
+
+/**
+ * Firefox's full-page translator (translations-document.sys.mjs) sends an
+ * element's content to its engine as one piece — adjacent Text nodes
+ * serialise into a single run of text — and applies the result with its
+ * `merge()`: every child is detached, first to last; then the translated
+ * nodes are appended in order, reusing the element's live Text nodes BY
+ * POSITION (their data overwritten) and its live elements by identity, each
+ * merged recursively before it is re-appended. A run of several renderer Text
+ * nodes comes back as one translated text, so the first node of the run
+ * carries the whole translation and the rest are never re-appended: they stay
+ * detached while the renderer still holds them.
+ *
+ * Like the other out-of-world helpers, this uses DOM natives captured at
+ * import: Firefox applies translations through Xray wrappers, which never see
+ * a page's prototype patches.
+ *
+ * One deliberate difference in ordering: Firefox overwrites a reused Text
+ * node, and merges a child element, while it is detached, and browsers report
+ * those mutations to page observers through the DOM's transient registered
+ * observers. jsdom does not implement transient observers, so it would never
+ * report them. Here each node is overwritten or merged just after it is
+ * re-appended instead: every parent's own record sequence and the final DOM
+ * are the same, and jsdom sees every mutation a browser would report.
+ */
+export function mergeLikeFirefox(element: Element, translate: TranslateFn = pseudoTranslate): void {
+  const children = [...element.childNodes];
+  const translated: Array<string | Element> = [];
+  let run = '';
+  const endRun = (): void => {
+    if (run === '') return;
+    translated.push(/\S/.test(run) ? translate(run) : run);
+    run = '';
+  };
+  for (const child of children) {
+    if (isText(child)) {
+      run += child.data;
+    } else if (child instanceof Element) {
+      endRun();
+      translated.push(child);
+    }
+  }
+  endRun();
+
+  const liveTextNodes = children.filter(isText);
+  let first = element.firstChild;
+  while (first) {
+    nativeDom.removeChild.call(element, first);
+    first = element.firstChild;
+  }
+  for (const item of translated) {
+    if (typeof item === 'string') {
+      const reused = liveTextNodes.shift();
+      if (reused) {
+        nativeDom.appendChild.call(element, reused);
+        nativeDom.setData(reused, item);
+      } else {
+        const created = document.createTextNode(item);
+        simulatorOwnedTextNodes.add(created);
+        nativeDom.appendChild.call(element, created);
+      }
+    } else {
+      nativeDom.appendChild.call(element, item);
+      if (/\S/.test(item.textContent ?? '')) mergeLikeFirefox(item, translate);
+    }
+  }
+}
+
+/**
+ * The whole of a Firefox page translation of `element`, in the order a real
+ * one happens: `<html lang>` is set to the target language from outside the
+ * page's JavaScript world as translation starts, and the translations arrive
+ * later, from the engine running in another process — so the merge happens in
+ * a later task.
+ */
+export async function translateLikeFirefox(
+  element: Element,
+  translate: TranslateFn = pseudoTranslate,
+  targetLanguage = 'x-pseudo'
+): Promise<void> {
+  const doc = element.ownerDocument;
+  nativeDom.setAttribute.call(doc.documentElement, 'lang', targetLanguage);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  mergeLikeFirefox(element, translate);
 }

@@ -22,3 +22,6 @@ jobs:
       # Covers what jsdom cannot: a translator in the browser's own isolated
       # world, and the animationstart-based detection stylesheet.
       - run: npm run test:browser
+      # Firefox's own full-page translator against a React page. Downloads an
+      # en->fr model on first use, so it needs network access.
+      - run: firefox --version && npm run test:firefox

@@ -1,8 +1,10 @@
 /**
  * Makes React (and any other text-node-owning renderer) resilient to browser
- * page translation (Chrome / Google Translate), which merges and replaces
- * Text nodes with `<font>` wrappers. React keeps references to the original,
- * now detached, Text nodes, so without this shim:
+ * page translation — Chrome / Google Translate and Edge, which merge and
+ * replace Text nodes with `<font>` wrappers, and Firefox, which empties and
+ * refills translated elements, reusing only some of their Text nodes. React
+ * keeps references to the original, now detached, Text nodes, so without this
+ * shim:
  *
  *  - unmounting translated conditional text throws NotFoundError (removeChild)
  *  - mounting content before translated text throws NotFoundError (insertBefore)
@@ -36,6 +38,14 @@
  *    detected, unrecoverable parent mismatches degrade to guarded best-effort
  *    operations instead of throwing.
  *
+ * 4. Firefox applies a translation to an element by detaching every child and
+ *    appending the translation back, reusing Text nodes by position; all but
+ *    the first node of each run of text stay detached (see
+ *    recognizeChildrenMerges). A lossy merge gets a WHOLE-PARENT group — the
+ *    parent's original children and pre-translation text — restored before
+ *    any renderer operation on one of them, attached or not. Firefox then
+ *    re-translates the restored nodes one by one, in place.
+ *
  * Arming, and why it cannot rely on the patches above: a browser's page
  * translator runs in the engine's own ISOLATED WORLD — it shares the DOM but
  * holds a separate copy of Node.prototype (Chromium runs the translate script
@@ -45,8 +55,11 @@
  *
  *  - Chrome's translator adds a `translated-*` class to <html> a few hundred
  *    ms before it touches text: an attribute sentinel catches that, and
- *    attributes are shared across worlds. (Not `lang` — see
- *    hasTranslatedClass.)
+ *    attributes are shared across worlds.
+ *  - Firefox's translator sets <html lang> as it starts. Apps write that
+ *    attribute too, so only a write from outside the page counts — told apart
+ *    by wrappers on the <html> instance that the page's own writes go through
+ *    and a translator's never do (see trackPageAttributeWrites).
  *  - Edge's translator and the Google Translate extension mark nothing. For
  *    those, a detection stylesheet (DETECTION_CSS) puts a CSS animation on the
  *    translator's signature <font>, and `animationstart` fires whichever world
@@ -60,23 +73,33 @@
  */
 
 interface DisplacedOriginal {
-  node: Text;
-  /** The node's value before translation touched it (normalize mutates the merge target). */
-  value: string;
+  node: Node;
+  /**
+   * A Text node's value before translation touched it (normalize and Firefox's
+   * merge both overwrite nodes they reuse); null for any other node.
+   */
+  value: string | null;
 }
 
 interface DisplacementGroup {
   parent: Node;
-  /** Renderer-owned text nodes this group stands in for, in document order. */
+  /** Renderer-owned nodes this group stands in for, in document order. */
   originals: DisplacedOriginal[];
   /** Nodes currently displaying the originals' content (empty if translation deleted the run). */
   replacement: Node[];
   /** Position hints captured at removal time, used when `replacement` is empty. */
   previousSiblingHint: Node | null;
   nextSiblingHint: Node | null;
+  /**
+   * The originals are ALL of the parent's children, text and elements, and
+   * restoring rebuilds the parent's child list (Firefox's merge — see
+   * recognizeChildrenMerges). Otherwise they are one displaced run of text
+   * that `replacement` stands in for (Chrome/Edge wrap-and-remove).
+   */
+  wholeParent: boolean;
 }
 
-const displaced = new WeakMap<Text, DisplacementGroup>();
+const displaced = new WeakMap<Node, DisplacementGroup>();
 const groupByReplacementNode = new WeakMap<Node, DisplacementGroup>();
 /** Live merge targets (normalize) carrying content of already-detached originals. */
 const pendingCarrierOriginals = new WeakMap<Text, DisplacedOriginal[]>();
@@ -401,6 +424,7 @@ function handleDisplacedText(removed: Text, record: MutationRecord, now: number)
       replacement: run,
       previousSiblingHint: record.previousSibling,
       nextSiblingHint: record.nextSibling,
+      wholeParent: false,
     };
     pendingCarrierOriginals.delete(removed);
     registerGroup(group);
@@ -469,6 +493,7 @@ function flushPendingOrphans(): void {
       replacement: [],
       previousSiblingHint: orphan.previousSibling,
       nextSiblingHint: orphan.nextSibling,
+      wholeParent: false,
     };
     pendingCarrierOriginals.delete(orphan.removed);
     registerGroup(group);
@@ -476,13 +501,146 @@ function flushPendingOrphans(): void {
   pendingOrphans = [];
 }
 
+/**
+ * Firefox's full-page translator (`merge()` in translations-document.sys.mjs)
+ * applies a translation to an element by detaching every child, first to
+ * last, then appending the translated nodes in order: live Text nodes are
+ * reused BY POSITION with their data overwritten, live elements by identity.
+ * Its engine sees adjacent Text nodes as one run of text, so a run of several
+ * renderer Text nodes comes back as one — the first node carries the whole
+ * run's translation and the rest are never re-appended. They stay detached
+ * while the renderer still holds them: the same silent freeze and
+ * NotFoundError as Chrome's displacement, from a different mutation shape.
+ *
+ * The shape is recognised per parent within one batch: removals that each
+ * take the first child (previousSibling null) until the parent is empty, then
+ * appends (nextSibling null), with at least one removed Text node appended
+ * back. A renderer does not produce it — it moves a node with a single
+ * insertBefore and never re-inserts a Text node it removed — and Firefox
+ * applies a translation synchronously, so one merge never straddles batches.
+ */
+interface ChildrenMerge {
+  parent: Node;
+  removed: Node[];
+  appended: Node[];
+  records: MutationRecord[];
+  emptied: boolean;
+}
+
+/** Returns the records that belong to recognised merges. */
+function recognizeChildrenMerges(records: MutationRecord[]): Set<MutationRecord> {
+  const consumed = new Set<MutationRecord>();
+  const open = new Map<Node, ChildrenMerge>();
+  /**
+   * A reused Text node's value before the merge overwrote it: its first
+   * characterData oldValue in the batch. Collected up front because where
+   * that record falls relative to the node's removal and re-append is not
+   * part of the shape (Firefox overwrites while the node is detached).
+   */
+  const valuesBefore = new Map<Node, string>();
+  for (const record of records) {
+    if (record.type === 'characterData' && record.oldValue !== null && !valuesBefore.has(record.target)) {
+      valuesBefore.set(record.target, record.oldValue);
+    }
+  }
+
+  const close = (merge: ChildrenMerge): void => {
+    open.delete(merge.parent);
+    const removed = new Set(merge.removed);
+    if (!merge.appended.some((node) => node instanceof Text && removed.has(node))) return;
+    for (const record of merge.records) consumed.add(record);
+    markTranslationDetected();
+    registerChildrenMerge(merge, valuesBefore);
+  };
+
+  for (const record of records) {
+    if (record.type !== 'childList') continue;
+    const removedOne =
+      record.addedNodes.length === 0 && record.removedNodes.length === 1 && record.previousSibling === null
+        ? record.removedNodes[0]
+        : undefined;
+    const appendedOne =
+      record.removedNodes.length === 0 && record.addedNodes.length === 1 && record.nextSibling === null
+        ? record.addedNodes[0]
+        : undefined;
+    const merge = open.get(record.target);
+    if (merge && !merge.emptied && removedOne) {
+      merge.removed.push(removedOne);
+      merge.records.push(record);
+      merge.emptied = record.nextSibling === null;
+      continue;
+    }
+    if (merge?.emptied && appendedOne) {
+      merge.appended.push(appendedOne);
+      merge.records.push(record);
+      continue;
+    }
+    if (merge) close(merge);
+    if (removedOne) {
+      open.set(record.target, {
+        parent: record.target,
+        removed: [removedOne],
+        appended: [],
+        records: [record],
+        emptied: record.nextSibling === null,
+      });
+    }
+  }
+  for (const merge of [...open.values()]) close(merge);
+  return consumed;
+}
+
+/**
+ * A merge that put every original back and added nothing translated its text
+ * in place: the renderer's nodes still stand for themselves, so there is
+ * nothing to restore. Otherwise the parent gets a whole-parent group recording
+ * its original children and their pre-translation text, restored before any
+ * renderer operation on one of them.
+ */
+function registerChildrenMerge(merge: ChildrenMerge, valuesBefore: Map<Node, string>): void {
+  // A parent merged again before being restored: the earlier group still holds
+  // the renderer's structure and pre-translation text, whereas this merge's
+  // "before" values are the earlier translation. Build on the earlier group.
+  let earlier: DisplacementGroup | undefined;
+  for (const node of merge.removed) {
+    const group = displaced.get(node) ?? groupByReplacementNode.get(node);
+    if (group?.wholeParent && group.parent === merge.parent) {
+      earlier = group;
+      break;
+    }
+  }
+  const originals: DisplacedOriginal[] = earlier ? [...earlier.originals] : [];
+  const known = new Set<Node>(originals.map((original) => original.node));
+  const earlierReplacement = new Set<Node>(earlier?.replacement ?? []);
+  for (const node of merge.removed) {
+    if (known.has(node) || earlierReplacement.has(node)) continue;
+    originals.push({ node, value: node instanceof Text ? (valuesBefore.get(node) ?? node.data) : null });
+    known.add(node);
+  }
+  if (earlier) unregisterGroup(earlier);
+
+  const appended = new Set(merge.appended);
+  const replacement = merge.appended.filter((node) => !known.has(node));
+  if (replacement.length === 0 && originals.every((original) => appended.has(original.node))) return;
+  registerGroup({
+    parent: merge.parent,
+    originals,
+    replacement,
+    previousSiblingHint: null,
+    nextSiblingHint: null,
+    wholeParent: true,
+  });
+}
+
 function processRecords(records: MutationRecord[]): void {
   if (records.length === 0) return;
   const now = performance.now();
   purgeExpired(now);
 
+  const merged = recognizeChildrenMerges(records);
   let sawTranslatorActivity = false;
   for (const record of records) {
+    if (merged.has(record)) continue;
     if (record.type === 'childList') {
       for (const added of record.addedNodes) {
         if (added.nodeName === 'FONT') sawTranslatorActivity = true;
@@ -501,7 +659,7 @@ function processRecords(records: MutationRecord[]): void {
   }
 
   for (const record of records) {
-    if (record.type !== 'childList') continue;
+    if (record.type !== 'childList' || merged.has(record)) continue;
     for (const removed of record.removedNodes) {
       const group = groupByReplacementNode.get(removed);
       if (group) {
@@ -530,24 +688,30 @@ function setTextValue(node: Text, value: string): void {
 }
 
 /**
- * Puts a displaced group's original text nodes back into the position its
+ * Puts a displaced group's original nodes back into the position its
  * replacement run occupies (removing the replacements), so the caller's
- * native DOM operation can proceed on a consistent tree.
+ * native DOM operation can proceed on a consistent tree. A whole-parent group
+ * rebuilds the parent's child list from its first child on: any node the
+ * renderer appended since the merge stays after the originals.
  */
-function restoreGroup(group: DisplacementGroup, skipValueFor?: Text): RestoreResult {
+function restoreGroup(group: DisplacementGroup, skipValueFor?: Node): RestoreResult {
   const natives = domNatives();
   unregisterGroup(group);
   for (const original of group.originals) {
     // Re-adoption makes the node's DOM state authoritative again; correlation
     // entries recorded while it was displaced would poison future sequences.
     recentOldValues.delete(original.node);
-    recentCarrierAccumulated.delete(original.node);
-    pendingCarrierOriginals.delete(original.node);
+    if (original.node instanceof Text) {
+      recentCarrierAccumulated.delete(original.node);
+      pendingCarrierOriginals.delete(original.node);
+    }
   }
 
   const attached = group.replacement.filter((node) => node.parentNode === group.parent);
   let cursor: Node | null;
-  if (attached.length > 0) {
+  if (group.wholeParent) {
+    cursor = group.parent.firstChild;
+  } else if (attached.length > 0) {
     cursor = attached[0] ?? null;
   } else if (group.previousSiblingHint?.parentNode === group.parent) {
     cursor = group.previousSiblingHint.nextSibling;
@@ -560,7 +724,9 @@ function restoreGroup(group: DisplacementGroup, skipValueFor?: Text): RestoreRes
   }
 
   for (const original of group.originals) {
-    if (original.node !== skipValueFor) setTextValue(original.node, original.value);
+    if (original.value !== null && original.node !== skipValueFor && original.node instanceof Text) {
+      setTextValue(original.node, original.value);
+    }
     if (original.node === cursor) {
       cursor = original.node.nextSibling;
       continue;
@@ -576,11 +742,39 @@ function restoreGroup(group: DisplacementGroup, skipValueFor?: Text): RestoreRes
   return 'restored';
 }
 
-function restoreDisplaced(node: Text, skipValue = false): RestoreResult {
+function restoreDisplaced(node: Node, skipValue = false): RestoreResult {
   drainPendingRecords();
   const group = displaced.get(node);
   if (!group) return 'untracked';
-  return restoreGroup(group, skipValue ? node : undefined);
+  const result = restoreGroup(group, skipValue ? node : undefined);
+  // The restore's own mutations are not translator activity, and read back
+  // they would be misattributed: a translator-created Text node removed after
+  // the originals were inserted before it looks like one the originals
+  // displaced.
+  observer?.takeRecords();
+  return result;
+}
+
+/**
+ * Whether a detached node might belong to a displacement group. Text nodes
+ * always drain pending records first (a displacement may not be folded in
+ * yet). Other nodes only join groups through a Firefox merge, which marks
+ * translation detected and is folded in before any renderer task runs — so
+ * until then, inserting an element costs nothing extra.
+ */
+function mayBeDisplaced(node: Node): boolean {
+  return node instanceof Text || (translationDetected && displaced.has(node));
+}
+
+/**
+ * Firefox's merge leaves renderer nodes attached that no longer stand for
+ * their own content: a reused Text node carries its whole run's translation
+ * while the rest of the run is detached, and siblings may be reordered. Any
+ * renderer operation on a member of such a group restores the parent first,
+ * so the operation lands on the structure the renderer built.
+ */
+function restoreAttachedMember(node: Node, skipValue = false): void {
+  if (displaced.get(node)?.wholeParent) restoreDisplaced(node, skipValue);
 }
 
 let uninstallCurrent: (() => void) | null = null;
@@ -592,11 +786,11 @@ export interface TranslationResilienceOptions {
   /**
    * Install the document-wide observer immediately instead of waiting for a
    * translation signal. The lazy default costs nothing until translation
-   * starts and now arms on the translator's own <font> wrappers (see
-   * noticeTranslatorFont), so it covers translators that never mark <html> —
-   * Edge's built-in translator, the Google Translate extension. eager remains
-   * as an escape hatch for a translator that would displace text without even
-   * inserting a recognizable <font> wrapper.
+   * starts, and arms on Chrome's translated-* class, on Firefox's <html lang>
+   * write from outside the page, and on the translator's own <font> wrappers
+   * for translators that mark nothing (Edge's built-in translator, the Google
+   * Translate extension). eager remains as an escape hatch for a translator
+   * that marks nothing and inserts no recognizable <font> wrapper.
    */
   eager?: boolean;
 }
@@ -607,19 +801,79 @@ export interface TranslationResilienceOptions {
  * ~275-500ms ahead of the first text mutation in real Chrome. The class VALUE
  * is checked (not just "class changed") because extensions add unrelated
  * classes to <html> on ordinary page loads.
- *
- * `lang` is deliberately not a signal, for the same reason: applications write
- * it themselves — i18n libraries sync <html lang> when language detection
- * resolves and on every switch (WCAG 3.1.1) — so arming on it would run the
- * full observer for the whole session on every such page. It would buy no
- * coverage in return. Google's translate script adds the class first, in the
- * same call, and only rewrites a `lang` that is already present. Edge and the
- * Google Translate extension never touch it. Firefox does flip it, but
- * displaces text by detaching and re-appending children, a shape the observer
- * does not recognise, so arming early changes nothing there.
  */
 function hasTranslatedClass(doc: Document): boolean {
   return doc.documentElement.className.includes('translated-');
+}
+
+type PageWrite = <T>(write: () => T) => T;
+
+/**
+ * Firefox's translator sets <html lang> to the target language as it starts,
+ * well before it touches any text, and marks nothing else a page can see
+ * cheaply. But applications write <html lang> too — i18n libraries sync it
+ * when language detection resolves and on every switch (WCAG 3.1.1) — so the
+ * attribute changing says nothing on its own. Where the write comes from
+ * does: the page's own code reaches <html> through the page's JavaScript
+ * objects, while a browser translator writes from its isolated world (Chrome,
+ * Edge) or through Xray wrappers (Firefox), and neither ever sees a property
+ * the page defines on an element.
+ *
+ * So <html> — that one instance, never Element.prototype, which would tax
+ * every attribute write on the page — gets its own wrappers for each Element
+ * API that writes attributes, and for the `lang` accessor. A write through a
+ * wrapper is the page's own; a lang change that arrives any other way came
+ * from outside the page. Writes through an Attr node, a NamedNodeMap, or a
+ * prototype method called on <html> directly also count as outside: the
+ * cost of that misclassification is an observer armed early, never a missed
+ * translation.
+ *
+ * Returns a function removing every wrapper.
+ */
+function trackPageAttributeWrites(html: Element, asPageWrite: PageWrite): () => void {
+  const defined: string[] = [];
+  const define = (key: string, descriptor: PropertyDescriptor): void => {
+    if (Object.getOwnPropertyDescriptor(html, key)) return;
+    Object.defineProperty(html, key, { configurable: true, enumerable: false, ...descriptor });
+    defined.push(key);
+  };
+  const wrap = <A extends unknown[], R>(key: string, method: ((this: Element, ...args: A) => R) | undefined): void => {
+    if (typeof method !== 'function') return;
+    define(key, {
+      writable: true,
+      value(this: Element, ...args: A): R {
+        return this === html ? asPageWrite(() => method.call(this, ...args)) : method.call(this, ...args);
+      },
+    });
+  };
+  const proto = Element.prototype;
+  wrap('setAttribute', proto.setAttribute);
+  wrap('setAttributeNS', proto.setAttributeNS);
+  wrap('removeAttribute', proto.removeAttribute);
+  wrap('removeAttributeNS', proto.removeAttributeNS);
+  wrap('toggleAttribute', proto.toggleAttribute);
+  wrap('setAttributeNode', proto.setAttributeNode);
+  wrap('setAttributeNodeNS', proto.setAttributeNodeNS);
+  wrap('removeAttributeNode', proto.removeAttributeNode);
+
+  const view = html.ownerDocument.defaultView;
+  const lang =
+    view && html instanceof view.HTMLElement
+      ? Object.getOwnPropertyDescriptor(view.HTMLElement.prototype, 'lang')
+      : undefined;
+  const setLang = lang?.set;
+  if (lang?.get && setLang) {
+    define('lang', {
+      get: lang.get,
+      set(this: Element, value: string) {
+        asPageWrite(() => setLang.call(this, value));
+      },
+    });
+  }
+
+  return () => {
+    for (const key of defined) Reflect.deleteProperty(html, key);
+  };
 }
 
 export function installTranslationResilience(options: TranslationResilienceOptions = {}): () => void {
@@ -629,6 +883,8 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   emitEvent = options.onEvent ?? noopEvent;
 
   let teardownDetection: () => void = () => undefined;
+  /** <html lang> changed from outside the page (see trackPageAttributeWrites). */
+  let foreignLangWriteSeen = false;
 
   const activateObserver = (): void => {
     if (observer) return;
@@ -655,6 +911,38 @@ export function installTranslationResilience(options: TranslationResilienceOptio
    */
   const sentinelSyncCheck = (): void => {
     if (sentinelActive && hasTranslatedClass(doc)) activateObserver();
+  };
+
+  /**
+   * `pageWrite` is true for records produced inside one of the page's own
+   * writes to <html>; a lang record anywhere else is a translator (Firefox)
+   * starting, which it does well before it changes any text.
+   */
+  const onSentinelRecords = (records: MutationRecord[], pageWrite: boolean): void => {
+    if (!pageWrite && records.some((record) => record.attributeName === 'lang')) {
+      foreignLangWriteSeen = true;
+      emitEvent('<html lang> changed from outside the page');
+      activateObserver();
+      return;
+    }
+    if (hasTranslatedClass(doc)) activateObserver();
+  };
+
+  /**
+   * Brackets one of the page's own writes to <html>: records already queued
+   * are someone else's and are handled first; the records the write itself
+   * produces are taken synchronously, before the sentinel's callback could
+   * see them, and handled as the page's.
+   */
+  const asPageWrite: PageWrite = (write) => {
+    const before = sentinelObserver?.takeRecords() ?? [];
+    if (before.length > 0) guarded('sentinel processing', () => onSentinelRecords(before, false), undefined);
+    try {
+      return write();
+    } finally {
+      const own = sentinelObserver?.takeRecords() ?? [];
+      if (own.length > 0) guarded('sentinel processing', () => onSentinelRecords(own, true), undefined);
+    }
   };
 
   /**
@@ -711,10 +999,13 @@ export function installTranslationResilience(options: TranslationResilienceOptio
    * for translator evidence at that point is what separates "a translator
    * moved this node" from a genuine renderer bug — so the shim degrades
    * gracefully on translated pages while still throwing on untranslated ones.
+   * A <html lang> change from outside the page is evidence too: Firefox leaves
+   * no markup behind, and nothing but a translator or an extension writes
+   * there from outside the page's world.
    */
   const translationEvident = (): boolean => {
     if (translationDetected) return true;
-    if (!documentShowsTranslation(doc)) return false;
+    if (!foreignLangWriteSeen && !documentShowsTranslation(doc)) return false;
     emitEvent('translation evidence found on repair path');
     activateObserver();
     markTranslationDetected();
@@ -724,20 +1015,16 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   if (options.eager || hasTranslatedClass(doc)) {
     activateObserver();
   } else {
-    sentinelObserver = new MutationObserver(() => {
-      guarded(
-        'sentinel processing',
-        () => {
-          if (hasTranslatedClass(doc)) activateObserver();
-        },
-        undefined
-      );
+    sentinelObserver = new MutationObserver((records) => {
+      guarded('sentinel processing', () => onSentinelRecords(records, false), undefined);
     });
-    sentinelObserver.observe(doc.documentElement, { attributes: true, attributeFilter: ['class'] });
+    sentinelObserver.observe(doc.documentElement, { attributes: true, attributeFilter: ['lang', 'class'] });
     sentinelActive = true;
+    const stopTrackingPageWrites = trackPageAttributeWrites(doc.documentElement, asPageWrite);
     const removeStylesheet = installDetectionStylesheet(doc);
     doc.addEventListener('animationstart', onDetectionAnimation, true);
     teardownDetection = () => {
+      stopTrackingPageWrites();
       removeStylesheet();
       doc.removeEventListener('animationstart', onDetectionAnimation, true);
     };
@@ -749,7 +1036,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
       const outcome = guarded(
         'removeChild repair',
         (): 'native' | 'handled' => {
-          const result = child instanceof Text ? restoreDisplaced(child) : 'untracked';
+          const result = mayBeDisplaced(child) ? restoreDisplaced(child) : 'untracked';
           if (result === 'gone') {
             // The displaced content is already absent, which is what this removal wanted.
             emitEvent('removeChild: displaced text already gone, removal skipped');
@@ -769,6 +1056,8 @@ export function installTranslationResilience(options: TranslationResilienceOptio
         'native'
       );
       if (outcome === 'handled') return child;
+    } else if (translationDetected) {
+      guarded('removeChild member restore', () => restoreAttachedMember(child), undefined);
     }
     natives.removeChild.call(this, child);
     return child;
@@ -777,14 +1066,16 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   Node.prototype.insertBefore = function insertBefore<T extends Node>(this: Node, node: T, child: Node | null): T {
     sentinelSyncCheck();
     noticeTranslatorFont(node);
-    if (node instanceof Text && node.parentNode === null) {
-      guarded('insertBefore node repair', () => restoreDisplaced(node), 'untracked');
+    if (node.parentNode === null) {
+      if (mayBeDisplaced(node)) guarded('insertBefore node repair', () => restoreDisplaced(node), 'untracked');
+    } else if (translationDetected) {
+      guarded('insertBefore node restore', () => restoreAttachedMember(node), undefined);
     }
     if (child && child.parentNode !== this) {
       const outcome = guarded(
         'insertBefore reference repair',
         (): 'native' | 'handled' => {
-          const result = child instanceof Text ? restoreDisplaced(child) : 'untracked';
+          const result = mayBeDisplaced(child) ? restoreDisplaced(child) : 'untracked';
           if (result === 'restored' && child.parentNode === this) return 'native';
           if (translationEvident()) {
             // The reference node is unrecoverable, or restoring it put it back
@@ -799,6 +1090,8 @@ export function installTranslationResilience(options: TranslationResilienceOptio
         'native'
       );
       if (outcome === 'handled') return node;
+    } else if (child && translationDetected) {
+      guarded('insertBefore reference restore', () => restoreAttachedMember(child), undefined);
     }
     natives.insertBefore.call(this, node, child);
     return node;
@@ -807,16 +1100,21 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   Node.prototype.appendChild = function appendChild<T extends Node>(this: Node, node: T): T {
     sentinelSyncCheck();
     noticeTranslatorFont(node);
-    if (node instanceof Text && node.parentNode === null) {
-      guarded('appendChild repair', () => restoreDisplaced(node), 'untracked');
+    if (node.parentNode === null) {
+      if (mayBeDisplaced(node)) guarded('appendChild repair', () => restoreDisplaced(node), 'untracked');
+    } else if (translationDetected) {
+      guarded('appendChild node restore', () => restoreAttachedMember(node), undefined);
     }
     natives.appendChild.call(this, node);
     return node;
   };
 
   const restoreAfterWrite = (node: Node): void => {
-    if (node instanceof Text && node.parentNode === null) {
+    if (!(node instanceof Text)) return;
+    if (node.parentNode === null) {
       guarded('text write repair', () => restoreDisplaced(node, true), 'untracked');
+    } else if (translationDetected) {
+      guarded('text write restore', () => restoreAttachedMember(node, true), undefined);
     }
   };
 
