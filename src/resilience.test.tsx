@@ -3,6 +3,7 @@ import { render } from '@testing-library/react';
 import { installTranslationResilience } from './resilience';
 import {
   displaceFromIsolatedWorld,
+  mergeLikeFirefox,
   pseudoTranslate,
   startTranslateObserver,
   translateLikeFirefox,
@@ -1165,6 +1166,61 @@ describe('pages Firefox is not translating', () => {
     }
   });
 
+  it("does not take Chrome's rewrite of the page's lang for Firefox's signal", async () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ onEvent: (message) => events.push(message) });
+    const el = document.createElement('div');
+    try {
+      document.documentElement.lang = 'de';
+      // Chrome, from its isolated world: the class, then the page's lang.
+      document.documentElement.classList.add('translated-ltr');
+      Element.prototype.setAttribute.call(document.documentElement, 'lang', 'en');
+      await flushMicrotasks();
+      expect(events).toContain('translation signal detected, observing document');
+
+      document.body.appendChild(el);
+      const label = document.createTextNode('Label');
+      const stale = document.createElement('span');
+      stale.textContent = 'old';
+      el.append(label, stale);
+      await flushMicrotasks();
+      while (el.firstChild) el.firstChild.remove();
+      el.append(label);
+      label.data = 'Label:';
+      const fresh = document.createElement('span');
+      fresh.textContent = 'new';
+      el.append(fresh);
+      await flushMicrotasks();
+      label.data = 'Label 2:';
+
+      expect(el.innerHTML).toBe('Label 2:<span>new</span>');
+      expect(events).not.toContain('translation activity detected');
+    } finally {
+      el.remove();
+      document.documentElement.classList.remove('translated-ltr');
+      uninstall();
+    }
+  });
+
+  it('does not take Chrome\'s lang reset on "show original" for Firefox\'s signal', async () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ onEvent: (message) => events.push(message) });
+    try {
+      document.documentElement.lang = 'de';
+      document.documentElement.classList.add('translated-ltr');
+      Element.prototype.setAttribute.call(document.documentElement, 'lang', 'en');
+      await flushMicrotasks();
+      // Chrome's restore removes its class first, then puts the page's lang back.
+      document.documentElement.classList.remove('translated-ltr');
+      Element.prototype.setAttribute.call(document.documentElement, 'lang', 'de');
+      await flushMicrotasks();
+
+      expect(events).not.toContain('<html lang> changed from outside the page');
+    } finally {
+      uninstall();
+    }
+  });
+
   it('still recognises Firefox when something else armed the observer first', async () => {
     const uninstall = installTranslationResilience({ eager: true });
     try {
@@ -1176,6 +1232,39 @@ describe('pages Firefox is not translating', () => {
       rerender(<TowerCase count={5} />);
 
       expect(div.textContent).toBe('There are 5 lights in the tower');
+    } finally {
+      uninstall();
+    }
+  });
+});
+
+describe('installed after Firefox started translating', () => {
+  afterEach(() => {
+    document.documentElement.removeAttribute('lang');
+  });
+
+  // Firefox writes <html lang> once, when it starts. A shim installed after
+  // that never sees it, but Firefox also tags the elements it sends to its
+  // engine with data-moz-translations-id before their translation arrives —
+  // which an eager observer does see.
+  it('eager mode recognises Firefox from the elements it tags', async () => {
+    const { container, rerender } = render(<LinkSentenceCase word="today" />);
+    const p = container.firstElementChild;
+    const link = p?.querySelector('a');
+    if (!p || !link) throw new Error('setup failed');
+    Element.prototype.setAttribute.call(document.documentElement, 'lang', 'x-pseudo');
+    await flushMicrotasks();
+
+    const uninstall = installTranslationResilience({ eager: true });
+    try {
+      Element.prototype.setAttribute.call(link, 'data-moz-translations-id', '0');
+      await flushMicrotasks();
+      mergeLikeFirefox(p);
+      await flushMicrotasks();
+
+      rerender(<LinkSentenceCase word="tomorrow" />);
+
+      expect(p.textContent).toBe(`This is a sentence ${pseudoTranslate('with a link')} written tomorrow`);
     } finally {
       uninstall();
     }
@@ -1237,6 +1326,28 @@ describe('installation edge cases', () => {
       uninstallA();
     }
     expect(Object.getOwnPropertyNames(html)).toEqual([]);
+  });
+
+  it('uninstalls cleanly even when a wrapper beneath its own is malformed', () => {
+    const html = document.documentElement;
+    // Another copy's wrapper whose state cannot be read.
+    const foreign = function (this: Element, name: string, value: string): void {
+      Element.prototype.setAttribute.call(this, name, value);
+    };
+    Object.defineProperty(foreign, Symbol.for('translation-resilience.html-write-wrapper'), {
+      get() {
+        throw new Error('malformed');
+      },
+    });
+    Object.defineProperty(html, 'setAttribute', { configurable: true, writable: true, value: foreign });
+    const nativeInsertBefore = Node.prototype.insertBefore;
+    const uninstall = installTranslationResilience();
+    try {
+      expect(() => uninstall()).not.toThrow();
+      expect(Node.prototype.insertBefore).toBe(nativeInsertBefore);
+    } finally {
+      Reflect.deleteProperty(html, 'setAttribute');
+    }
   });
 
   it('installs on a document whose <html> is not extensible', () => {

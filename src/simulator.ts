@@ -241,6 +241,7 @@ const nativeDom = {
   removeChild: Node.prototype.removeChild,
   appendChild: Node.prototype.appendChild,
   setAttribute: Element.prototype.setAttribute,
+  removeAttribute: Element.prototype.removeAttribute,
   setData(node: CharacterData, value: string): void {
     if (!nativeDataSetter) throw new Error('simulator: CharacterData.prototype.data has no setter');
     nativeDataSetter.call(node, value);
@@ -328,6 +329,20 @@ export function displaceFromIsolatedWorld(
  * are the same, and jsdom sees every mutation a browser would report.
  */
 export function mergeLikeFirefox(element: Element, translate: TranslateFn = pseudoTranslate): void {
+  mergeChildren(element, translate);
+  for (const tagged of element.querySelectorAll(`[${FIREFOX_ID_ATTRIBUTE}]`)) {
+    nativeDom.removeAttribute.call(tagged, FIREFOX_ID_ATTRIBUTE);
+  }
+}
+
+/**
+ * Firefox tags the elements inside a block it sends to its engine, so it can
+ * match them up with the translated markup, and removes the tags when it
+ * merges. Blocks of plain text carry none.
+ */
+const FIREFOX_ID_ATTRIBUTE = 'data-moz-translations-id';
+
+function mergeChildren(element: Element, translate: TranslateFn): void {
   const children = [...element.childNodes];
   const translated: Array<string | Element> = [];
   let run = '';
@@ -365,7 +380,7 @@ export function mergeLikeFirefox(element: Element, translate: TranslateFn = pseu
       }
     } else {
       nativeDom.appendChild.call(element, item);
-      if (/\S/.test(item.textContent ?? '')) mergeLikeFirefox(item, translate);
+      if (/\S/.test(item.textContent ?? '')) mergeChildren(item, translate);
     }
   }
 }
@@ -373,7 +388,8 @@ export function mergeLikeFirefox(element: Element, translate: TranslateFn = pseu
 /**
  * The whole of a Firefox page translation of `element`, in the order a real
  * one happens: `<html lang>` is set to the target language from outside the
- * page's JavaScript world as translation starts, and the translations arrive
+ * page's JavaScript world as translation starts, the elements inside the
+ * block are tagged as it is sent to the engine, and the translation arrives
  * later, from the engine running in another process — so the merge happens in
  * a later task.
  */
@@ -384,6 +400,9 @@ export async function translateLikeFirefox(
 ): Promise<void> {
   const doc = element.ownerDocument;
   nativeDom.setAttribute.call(doc.documentElement, 'lang', targetLanguage);
+  element.querySelectorAll('*').forEach((descendant, index) => {
+    nativeDom.setAttribute.call(descendant, FIREFOX_ID_ATTRIBUTE, String(index));
+  });
   await new Promise((resolve) => setTimeout(resolve, 0));
   mergeLikeFirefox(element, translate);
 }

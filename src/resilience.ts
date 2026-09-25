@@ -685,6 +685,15 @@ function forgetPageMoves(): void {
 let firefoxSignalSeen = false;
 const NO_RECORDS: ReadonlySet<MutationRecord> = new Set();
 
+/**
+ * Firefox's other mark: it tags the elements inside each block it sends to its
+ * engine (so it can match them up again), before the translation comes back,
+ * and removes the tags when it merges. Blocks of plain text carry none, and a
+ * lazy shim is not observing yet when they appear — but it is how an eager
+ * shim installed after Firefox's <html lang> write still recognises it.
+ */
+const FIREFOX_ID_ATTRIBUTE = 'data-moz-translations-id';
+
 function processRecords(records: MutationRecord[]): void {
   try {
     processRecordBatch(records);
@@ -698,6 +707,13 @@ function processRecordBatch(records: MutationRecord[]): void {
   const now = performance.now();
   purgeExpired(now);
 
+  if (
+    !firefoxSignalSeen &&
+    records.some((record) => record.type === 'attributes' && record.attributeName === FIREFOX_ID_ATTRIBUTE)
+  ) {
+    firefoxSignalSeen = true;
+    emitEvent('Firefox translation markers detected');
+  }
   const merged = firefoxSignalSeen ? recognizeChildrenMerges(records) : NO_RECORDS;
   let sawTranslatorActivity = false;
   for (const record of records) {
@@ -1013,7 +1029,7 @@ function trackPageAttributeWrites(html: Element, asPageWrite: PageWrite): () => 
 
   return () => {
     active = false;
-    for (const restore of restorers) restore();
+    for (const restore of restorers) guarded('<html> wrapper removal', restore, undefined);
   };
 }
 
@@ -1025,6 +1041,13 @@ export function installTranslationResilience(options: TranslationResilienceOptio
 
   let teardownDetection: () => void = () => undefined;
   let stopTrackingLang: () => void = () => undefined;
+  /**
+   * Chrome's translator rewrites a lang the page already has, from its
+   * isolated world — right after adding its class, and again after removing
+   * it on "show original". Once the class has been seen, a lang write from
+   * outside is Chrome's, never Firefox's signal.
+   */
+  let chromeMarkingSeen = hasTranslatedClass(doc);
 
   const activateObserver = (): void => {
     if (observer) return;
@@ -1034,7 +1057,14 @@ export function installTranslationResilience(options: TranslationResilienceOptio
     observer = new MutationObserver((records) => {
       guarded('record processing', () => processRecords(records), undefined);
     });
-    observer.observe(doc, { childList: true, subtree: true, characterData: true, characterDataOldValue: true });
+    observer.observe(doc, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      characterDataOldValue: true,
+      attributes: true,
+      attributeFilter: [FIREFOX_ID_ATTRIBUTE],
+    });
     emitEvent('translation signal detected, observing document');
   };
 
@@ -1060,7 +1090,8 @@ export function installTranslationResilience(options: TranslationResilienceOptio
    * observer, and in eager mode.
    */
   const onSentinelRecords = (records: MutationRecord[], pageWrite: boolean): void => {
-    if (!pageWrite && records.some((record) => record.attributeName === 'lang')) {
+    if (hasTranslatedClass(doc)) chromeMarkingSeen = true;
+    if (!pageWrite && !chromeMarkingSeen && records.some((record) => record.attributeName === 'lang')) {
       emitEvent('<html lang> changed from outside the page');
       firefoxSignalSeen = true;
       stopTrackingLang();

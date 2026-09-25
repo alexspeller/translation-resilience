@@ -206,6 +206,18 @@ describe('Firefox simulator fidelity', () => {
     expect(div.textContent).toBe(pseudoTranslate('There are 4 lights in the tower'));
   });
 
+  it('tags the elements of a block while its translation is pending, and untags them on merge', async () => {
+    const { container } = render(<LinkSentenceCase word="today" />);
+    const p = container.firstElementChild;
+    const link = p?.querySelector('a');
+    if (!p || !link) throw new Error('setup failed');
+
+    const pending = translateLikeFirefox(p);
+    expect(link.getAttribute('data-moz-translations-id')).toBe('0');
+    await pending;
+    expect(link.hasAttribute('data-moz-translations-id')).toBe(false);
+  });
+
   it('empties the element first to last, then appends the reused and translated nodes', () => {
     const { container } = render(<LinkSentenceCase word="today" />);
     const p = container.firstElementChild;
