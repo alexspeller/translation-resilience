@@ -253,6 +253,24 @@ try {
   }
 
   {
+    // Chrome's actual sequence, from its isolated world: the class, then a
+    // rewrite of the lang the page already has. Both are signals.
+    const { evaluate, isolated } = await session();
+    await evaluate(`document.documentElement.lang = 'de'; 1`);
+    await evaluate(
+      `document.documentElement.classList.add('translated-ltr'); document.documentElement.setAttribute('lang', 'en'); 1`,
+      isolated
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    const events = await evaluate('window.__events');
+    check(
+      "arms on Chrome's class-then-lang marking",
+      Array.isArray(events) && events.includes('translation signal detected, observing document'),
+      true
+    );
+  }
+
+  {
     // Firefox's signal: <html lang> set by a translator from outside the
     // page. A genuine isolated world never sees the page's own wrappers on
     // <html>, which is what tells this write from the app's.

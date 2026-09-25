@@ -865,10 +865,12 @@ describe('Firefox full-page translation', () => {
       // The engine's translation can hold more text nodes than the original:
       // Firefox appends the extras as new nodes the renderer knows nothing of.
       await translateLikeFirefox(div, (text) => text);
+      // Overwritten after re-appending, as in mergeLikeFirefox: jsdom does not
+      // report mutations to detached nodes (no transient observers).
       nativeRemoveChild.call(div, greeting);
       nativeRemoveChild.call(div, bold);
-      nativeSetData(greeting, 'Bonjour ');
       nativeAppendChild.call(div, greeting);
+      nativeSetData(greeting, 'Bonjour ');
       nativeAppendChild.call(div, bold);
       nativeAppendChild.call(div, document.createTextNode(' !'));
       await flushMicrotasks();
@@ -906,6 +908,254 @@ describe('Firefox full-page translation', () => {
       await flushMicrotasks();
 
       expect(events).not.toContain('translation activity detected');
+    } finally {
+      uninstall();
+    }
+  });
+});
+
+interface WordItem {
+  id: string;
+  text: string;
+  hidden: boolean;
+}
+function Word({ word }: { word: WordItem }) {
+  return word.hidden ? null : word.text;
+}
+function Words({ words }: { words: WordItem[] }) {
+  return (
+    <p>
+      {words.map((word) => (
+        <Word key={word.id} word={word} />
+      ))}
+    </p>
+  );
+}
+function Empty() {
+  return null;
+}
+
+/**
+ * The Firefox merge shape — a parent emptied from the front, then refilled
+ * with some of the same Text nodes — can also come from the page itself: a
+ * keyed move of a text node that ends up an only child is a removal from the
+ * front and an append. None of it may be taken for translation.
+ */
+describe('telling page code from a Firefox merge', () => {
+  afterEach(() => {
+    document.documentElement.removeAttribute('lang');
+  });
+
+  const alpha = { id: 'a', text: 'alpha ', hidden: false };
+  const beta = { id: 'b', text: 'beta ', hidden: false };
+  const gamma = { id: 'c', text: 'gamma', hidden: false };
+  const delta = { id: 'd', text: 'delta', hidden: true };
+
+  it('does not resurrect text React deleted around a keyed move', async () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ eager: true, onEvent: (message) => events.push(message) });
+    try {
+      const { container, rerender } = render(<Words words={[alpha, beta, gamma, delta]} />);
+      const p = container.firstElementChild;
+      if (!p) throw new Error('setup failed');
+
+      rerender(<Words words={[delta, gamma]} />);
+      await flushMicrotasks();
+      expect(p.textContent).toBe('gamma');
+      rerender(<Words words={[delta]} />);
+      await flushMicrotasks();
+
+      expect(p.textContent).toBe('');
+      expect(events).not.toContain('translation activity detected');
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('does not resurrect text React deleted when the moved text is also rewritten', async () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ eager: true, onEvent: (message) => events.push(message) });
+    try {
+      const { container, rerender } = render(<Words words={[alpha, beta, gamma, delta]} />);
+      const p = container.firstElementChild;
+      if (!p) throw new Error('setup failed');
+
+      // A move and a text update in one commit: the moved node gets a
+      // characterData record, just as a node Firefox reuses does.
+      rerender(<Words words={[delta, { ...gamma, text: 'gamma!' }]} />);
+      await flushMicrotasks();
+      expect(p.textContent).toBe('gamma!');
+      rerender(<Words words={[delta]} />);
+      await flushMicrotasks();
+
+      expect(p.textContent).toBe('');
+      expect(events).not.toContain('translation activity detected');
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('does not resurrect elements React deleted around a keyed text move', async () => {
+    const uninstall = installTranslationResilience({ eager: true });
+    try {
+      function List({ phase, text }: { phase: number; text: string }) {
+        const children =
+          phase === 0
+            ? [<b key="a">A</b>, <i key="b">B</i>, text, <Empty key="e" />]
+            : [<Empty key="e" />, <Empty key="z" />, text];
+        return <p>{children}</p>;
+      }
+      const { container, rerender } = render(<List phase={0} text="hello" />);
+      const p = container.firstElementChild;
+      if (!p) throw new Error('setup failed');
+
+      rerender(<List phase={1} text="hello" />);
+      await flushMicrotasks();
+      rerender(<List phase={1} text="world" />);
+      await flushMicrotasks();
+
+      expect(p.innerHTML).toBe('world');
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('does not resurrect nodes page code cleared before re-appending some of them', async () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ eager: true, onEvent: (message) => events.push(message) });
+    const el = document.createElement('div');
+    try {
+      document.body.appendChild(el);
+      const label = document.createTextNode('Label');
+      const stale = document.createElement('span');
+      stale.textContent = 'old';
+      el.appendChild(label);
+      el.appendChild(stale);
+      await flushMicrotasks();
+
+      while (el.firstChild) el.removeChild(el.firstChild);
+      label.data = 'Label:';
+      el.appendChild(label);
+      const fresh = document.createElement('span');
+      fresh.textContent = 'new';
+      el.appendChild(fresh);
+      await flushMicrotasks();
+      label.data = 'Label 2:';
+
+      expect(el.innerHTML).toBe('Label 2:<span>new</span>');
+      expect(events).not.toContain('translation activity detected');
+    } finally {
+      el.remove();
+      uninstall();
+    }
+  });
+
+  it('keeps throwing on genuine bugs after the page moves an only child in place', async () => {
+    const uninstall = installTranslationResilience({ eager: true });
+    const el = document.createElement('span');
+    const parent = document.createElement('div');
+    try {
+      document.body.append(el, parent);
+      const text = document.createTextNode('x');
+      el.appendChild(text);
+      await flushMicrotasks();
+      el.appendChild(text);
+      await flushMicrotasks();
+
+      expect(() => parent.removeChild(document.createTextNode('stranger'))).toThrow();
+    } finally {
+      el.remove();
+      parent.remove();
+      uninstall();
+    }
+  });
+
+  it('keeps throwing on genuine bugs after a lang write it cannot attribute to the page', async () => {
+    const uninstall = installTranslationResilience();
+    const parent = document.createElement('div');
+    try {
+      document.body.appendChild(parent);
+      // A prototype method called on <html> directly bypasses the page-write
+      // wrappers: counted as foreign, so the observer arms early — but no
+      // translation has happened, so nothing may be masked.
+      Element.prototype.setAttribute.call(document.documentElement, 'lang', 'fr');
+      await flushMicrotasks();
+
+      expect(() => parent.removeChild(document.createTextNode('stranger'))).toThrow();
+    } finally {
+      parent.remove();
+      uninstall();
+    }
+  });
+});
+
+describe('installation edge cases', () => {
+  afterEach(() => {
+    document.documentElement.removeAttribute('lang');
+  });
+
+  it("stays dormant for the app's lang writes with two copies of the shim installed", async () => {
+    const eventsA: string[] = [];
+    const eventsB: string[] = [];
+    const uninstallA = installTranslationResilience({ onEvent: (message) => eventsA.push(message) });
+    vi.resetModules();
+    const copyB = await import('./resilience');
+    const uninstallB = copyB.installTranslationResilience({ onEvent: (message) => eventsB.push(message) });
+    const html = document.documentElement;
+    try {
+      html.lang = 'de';
+      html.setAttribute('lang', 'fr');
+      await flushMicrotasks();
+
+      expect(eventsA).not.toContain('translation signal detected, observing document');
+      expect(eventsB).not.toContain('translation signal detected, observing document');
+    } finally {
+      uninstallB();
+      uninstallA();
+    }
+    expect(Object.getOwnPropertyNames(html)).toEqual([]);
+  });
+
+  it('installs on a document whose <html> is not extensible', () => {
+    const doc = document.implementation.createHTMLDocument('frozen');
+    Object.preventExtensions(doc.documentElement);
+    let uninstall: (() => void) | undefined;
+    expect(() => {
+      uninstall = installTranslationResilience({ document: doc });
+    }).not.toThrow();
+    uninstall?.();
+  });
+
+  it('restores without moving renderer elements Firefox left in place', async () => {
+    const uninstall = installTranslationResilience();
+    try {
+      const { container, rerender } = render(<GreetingCase greeting="Hello " />);
+      const div = container.firstElementChild;
+      const greeting = div?.firstChild;
+      const bold = div?.lastChild;
+      if (!div || !(greeting instanceof Text) || !bold) throw new Error('setup failed');
+      await translateLikeFirefox(div, (text) => text);
+      // Firefox's translation holds an extra text node BEFORE the element.
+      nativeRemoveChild.call(div, greeting);
+      nativeRemoveChild.call(div, bold);
+      nativeAppendChild.call(div, greeting);
+      nativeSetData(greeting, 'Bonjour ');
+      nativeAppendChild.call(div, document.createTextNode('cher '));
+      nativeAppendChild.call(div, bold);
+      await flushMicrotasks();
+
+      const moves: Node[] = [];
+      const watcher = new MutationObserver((records) => {
+        for (const record of records) moves.push(...record.removedNodes);
+      });
+      watcher.observe(div, { childList: true });
+      rerender(<GreetingCase greeting="Hi " />);
+      for (const record of watcher.takeRecords()) moves.push(...record.removedNodes);
+      watcher.disconnect();
+
+      expect(div.textContent).toBe('Hi world');
+      // Moving an element re-creates what it hosts (iframes reload, inputs lose focus).
+      expect(moves).not.toContain(bold);
     } finally {
       uninstall();
     }

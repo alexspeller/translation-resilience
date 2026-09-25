@@ -515,9 +515,23 @@ function flushPendingOrphans(): void {
  * The shape is recognised per parent within one batch: removals that each
  * take the first child (previousSibling null) until the parent is empty, then
  * appends (nextSibling null), with at least one removed Text node appended
- * back. A renderer does not produce it — it moves a node with a single
- * insertBefore and never re-inserts a Text node it removed — and Firefox
- * applies a translation synchronously, so one merge never straddles batches.
+ * back. Page code can produce that sequence too — a keyed move of a text node
+ * that has become an only child is a removal from the front plus an append —
+ * so two more things must hold, each of which rules out what the other
+ * cannot:
+ *
+ *  - every Text node appended back was overwritten (a characterData record):
+ *    Firefox writes the translation into each node it reuses, while a plain
+ *    move changes no text;
+ *  - none of the nodes went through the patched DOM methods since records
+ *    were last processed (movedByPage): Firefox never calls them, while a
+ *    renderer's moves and removals always do — including one that rewrites a
+ *    text node in the same commit that moves it.
+ *
+ * Firefox applies a translation synchronously, so one merge lands in one
+ * batch — unless page code runs inside it (a custom element's
+ * connectedCallback touching a detached text node drains records midway), in
+ * which case the halves are judged separately and may be missed.
  */
 interface ChildrenMerge {
   parent: Node;
@@ -547,7 +561,11 @@ function recognizeChildrenMerges(records: MutationRecord[]): Set<MutationRecord>
   const close = (merge: ChildrenMerge): void => {
     open.delete(merge.parent);
     const removed = new Set(merge.removed);
-    if (!merge.appended.some((node) => node instanceof Text && removed.has(node))) return;
+    const reusedText = merge.appended.filter((node) => node instanceof Text && removed.has(node));
+    if (reusedText.length === 0 || !reusedText.every((node) => valuesBefore.has(node))) return;
+    if (merge.removed.some((node) => movedByPage.has(node)) || merge.appended.some((node) => movedByPage.has(node))) {
+      return;
+    }
     for (const record of merge.records) consumed.add(record);
     markTranslationDetected();
     registerChildrenMerge(merge, valuesBefore);
@@ -632,6 +650,19 @@ function registerChildrenMerge(merge: ChildrenMerge, valuesBefore: Map<Node, str
   });
 }
 
+/**
+ * Nodes the page moved or removed through the patched DOM methods since
+ * records were last processed — never a translator's work (see
+ * recognizeChildrenMerges). Filled only while the observer runs, and emptied
+ * each time records are processed, which covers every record those calls
+ * queued.
+ */
+const movedByPage = new Set<Node>();
+
+function notePageMove(node: Node): void {
+  if (observer) movedByPage.add(node);
+}
+
 function processRecords(records: MutationRecord[]): void {
   if (records.length === 0) return;
   const now = performance.now();
@@ -671,6 +702,7 @@ function processRecords(records: MutationRecord[]): void {
   }
 
   if (sawTranslatorActivity) flushPendingOrphans();
+  movedByPage.clear();
 }
 
 /** Synchronously fold in records the observer hasn't delivered yet. */
@@ -710,6 +742,11 @@ function restoreGroup(group: DisplacementGroup, skipValueFor?: Node): RestoreRes
   const attached = group.replacement.filter((node) => node.parentNode === group.parent);
   let cursor: Node | null;
   if (group.wholeParent) {
+    // Take the translator's own nodes out first: originals already in order
+    // then stay where they are rather than being moved in front of them —
+    // moving an element re-creates what it hosts (an iframe reloads, a
+    // focused input loses focus).
+    for (const node of attached) natives.removeChild.call(group.parent, node);
     cursor = group.parent.firstChild;
   } else if (attached.length > 0) {
     cursor = attached[0] ?? null;
@@ -824,55 +861,80 @@ type PageWrite = <T>(write: () => T) => T;
  * API that writes attributes, and for the `lang` accessor. A write through a
  * wrapper is the page's own; a lang change that arrives any other way came
  * from outside the page. Writes through an Attr node, a NamedNodeMap, or a
- * prototype method called on <html> directly also count as outside: the
- * cost of that misclassification is an observer armed early, never a missed
- * translation.
+ * prototype method called on <html> directly also count as outside. The only
+ * cost of that misclassification is an observer armed early: an outside lang
+ * write is never taken as evidence of translation (see translationEvident).
+ *
+ * A second copy of this package on the page (duplicated versions, micro
+ * frontends) wraps the first copy's wrappers rather than skipping them, so
+ * both see the page's writes as the page's.
  *
  * Returns a function removing every wrapper.
  */
 function trackPageAttributeWrites(html: Element, asPageWrite: PageWrite): () => void {
-  const defined: string[] = [];
-  const define = (key: string, descriptor: PropertyDescriptor): void => {
-    if (Object.getOwnPropertyDescriptor(html, key)) return;
-    Object.defineProperty(html, key, { configurable: true, enumerable: false, ...descriptor });
-    defined.push(key);
-  };
-  const wrap = <A extends unknown[], R>(key: string, method: ((this: Element, ...args: A) => R) | undefined): void => {
-    if (typeof method !== 'function') return;
-    define(key, {
-      writable: true,
-      value(this: Element, ...args: A): R {
-        return this === html ? asPageWrite(() => method.call(this, ...args)) : method.call(this, ...args);
+  let active = true;
+  const restorers: Array<() => void> = [];
+
+  /**
+   * Defines html[key], remembering what was there — the prototype's, or
+   * another copy's wrapper, which ours calls through to. Removal puts that
+   * back, unless something has since wrapped ours: then ours stays, inert.
+   * Any failure (a non-extensible <html>) leaves that key unwrapped, which
+   * only means writes through it count as outside.
+   */
+  const replace = (key: string, descriptor: PropertyDescriptor, isOurs: (current: PropertyDescriptor) => boolean) => {
+    guarded(
+      `<html> ${key} wrapper`,
+      () => {
+        const previous = Object.getOwnPropertyDescriptor(html, key);
+        if (previous && !previous.configurable) return;
+        Object.defineProperty(html, key, { configurable: true, enumerable: false, ...descriptor });
+        restorers.push(() => {
+          const current = Object.getOwnPropertyDescriptor(html, key);
+          if (!current || !isOurs(current)) return;
+          if (previous) Object.defineProperty(html, key, previous);
+          else Reflect.deleteProperty(html, key);
+        });
       },
-    });
+      undefined
+    );
   };
-  const proto = Element.prototype;
-  wrap('setAttribute', proto.setAttribute);
-  wrap('setAttributeNS', proto.setAttributeNS);
-  wrap('removeAttribute', proto.removeAttribute);
-  wrap('removeAttributeNS', proto.removeAttributeNS);
-  wrap('toggleAttribute', proto.toggleAttribute);
-  wrap('setAttributeNode', proto.setAttributeNode);
-  wrap('setAttributeNodeNS', proto.setAttributeNodeNS);
-  wrap('removeAttributeNode', proto.removeAttributeNode);
+
+  const wrap = <A extends unknown[], R>(key: string, current: ((this: Element, ...args: A) => R) | undefined): void => {
+    if (typeof current !== 'function') return;
+    const wrapper = function (this: Element, ...args: A): R {
+      return active && this === html ? asPageWrite(() => current.call(this, ...args)) : current.call(this, ...args);
+    };
+    replace(key, { writable: true, value: wrapper }, (descriptor) => descriptor.value === wrapper);
+  };
+  wrap('setAttribute', html.setAttribute);
+  wrap('setAttributeNS', html.setAttributeNS);
+  wrap('removeAttribute', html.removeAttribute);
+  wrap('removeAttributeNS', html.removeAttributeNS);
+  wrap('toggleAttribute', html.toggleAttribute);
+  wrap('setAttributeNode', html.setAttributeNode);
+  wrap('setAttributeNodeNS', html.setAttributeNodeNS);
+  wrap('removeAttributeNode', html.removeAttributeNode);
 
   const view = html.ownerDocument.defaultView;
-  const lang =
+  const inherited =
     view && html instanceof view.HTMLElement
       ? Object.getOwnPropertyDescriptor(view.HTMLElement.prototype, 'lang')
       : undefined;
+  const lang = Object.getOwnPropertyDescriptor(html, 'lang') ?? inherited;
+  const getLang = lang?.get;
   const setLang = lang?.set;
-  if (lang?.get && setLang) {
-    define('lang', {
-      get: lang.get,
-      set(this: Element, value: string) {
-        asPageWrite(() => setLang.call(this, value));
-      },
-    });
+  if (getLang && setLang) {
+    const set = function (this: Element, value: string): void {
+      if (active && this === html) asPageWrite(() => setLang.call(this, value));
+      else setLang.call(this, value);
+    };
+    replace('lang', { get: getLang, set }, (descriptor) => descriptor.set === set);
   }
 
   return () => {
-    for (const key of defined) Reflect.deleteProperty(html, key);
+    active = false;
+    for (const restore of restorers) restore();
   };
 }
 
@@ -883,8 +945,6 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   emitEvent = options.onEvent ?? noopEvent;
 
   let teardownDetection: () => void = () => undefined;
-  /** <html lang> changed from outside the page (see trackPageAttributeWrites). */
-  let foreignLangWriteSeen = false;
 
   const activateObserver = (): void => {
     if (observer) return;
@@ -920,7 +980,6 @@ export function installTranslationResilience(options: TranslationResilienceOptio
    */
   const onSentinelRecords = (records: MutationRecord[], pageWrite: boolean): void => {
     if (!pageWrite && records.some((record) => record.attributeName === 'lang')) {
-      foreignLangWriteSeen = true;
       emitEvent('<html lang> changed from outside the page');
       activateObserver();
       return;
@@ -999,13 +1058,14 @@ export function installTranslationResilience(options: TranslationResilienceOptio
    * for translator evidence at that point is what separates "a translator
    * moved this node" from a genuine renderer bug — so the shim degrades
    * gracefully on translated pages while still throwing on untranslated ones.
-   * A <html lang> change from outside the page is evidence too: Firefox leaves
-   * no markup behind, and nothing but a translator or an extension writes
-   * there from outside the page's world.
+   * A <html lang> change from outside the page is deliberately NOT evidence:
+   * it only arms the observer. Firefox's first merge marks translation
+   * detected, while a write merely misattributed to outside the page (see
+   * trackPageAttributeWrites) must not start masking genuine bugs.
    */
   const translationEvident = (): boolean => {
     if (translationDetected) return true;
-    if (!foreignLangWriteSeen && !documentShowsTranslation(doc)) return false;
+    if (!documentShowsTranslation(doc)) return false;
     emitEvent('translation evidence found on repair path');
     activateObserver();
     markTranslationDetected();
@@ -1049,6 +1109,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
             // different parent. Remove it from wherever it actually is.
             emitEvent('removeChild: removing node from its actual parent');
             if (child.parentNode) natives.removeChild.call(child.parentNode, child);
+            notePageMove(child);
             return 'handled';
           }
           return 'native';
@@ -1060,6 +1121,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
       guarded('removeChild member restore', () => restoreAttachedMember(child), undefined);
     }
     natives.removeChild.call(this, child);
+    notePageMove(child);
     return child;
   };
 
@@ -1083,6 +1145,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
             // right parent, which is the best position still guaranteed.
             emitEvent('insertBefore: reference gone, appending instead');
             natives.appendChild.call(this, node);
+            notePageMove(node);
             return 'handled';
           }
           return 'native';
@@ -1094,6 +1157,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
       guarded('insertBefore reference restore', () => restoreAttachedMember(child), undefined);
     }
     natives.insertBefore.call(this, node, child);
+    notePageMove(node);
     return node;
   };
 
@@ -1106,6 +1170,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
       guarded('appendChild node restore', () => restoreAttachedMember(node), undefined);
     }
     natives.appendChild.call(this, node);
+    notePageMove(node);
     return node;
   };
 
