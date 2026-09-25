@@ -245,8 +245,19 @@ try {
     );
   }
 } finally {
-  child.kill('SIGKILL');
-  fs.rmSync(profile, { recursive: true, force: true });
+  if (child.exitCode === null && child.signalCode === null) {
+    const exited = new Promise((resolve) => child.once('exit', resolve));
+    child.kill('SIGKILL');
+    await exited;
+  }
+  // Chrome's helper processes outlive the browser process briefly and can
+  // still be writing into the profile, so removal may race them (ENOTEMPTY).
+  // A leftover temp profile is not a test failure.
+  try {
+    fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (error) {
+    console.warn(`warning: could not remove temp profile ${profile}: ${error.message}`);
+  }
 }
 
 if (failures.length > 0) {
