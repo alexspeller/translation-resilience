@@ -8,7 +8,7 @@ import { installTranslationResilience } from 'translation-resilience';
 installTranslationResilience();
 ```
 
-Framework-agnostic (it patches the DOM layer, not React), dependency-free, ~4.4 kB min+gzip, and lazily activated — near-zero cost until a translator actually touches the page.
+Framework-agnostic (it patches the DOM layer, not React), dependency-free, ~4.8 kB min+gzip, and lazily activated — near-zero cost until a translator actually touches the page.
 
 ## The problem
 
