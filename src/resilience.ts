@@ -694,6 +694,22 @@ const NO_RECORDS: ReadonlySet<MutationRecord> = new Set();
  */
 const FIREFOX_ID_ATTRIBUTE = 'data-moz-translations-id';
 
+/**
+ * Tags stay on a block from when Firefox sends it until its translation is
+ * merged — the whole engine round trip — so an observer starting late most
+ * likely finds them already in place rather than seeing them appear.
+ */
+function noticeFirefoxTags(doc: Document): void {
+  if (firefoxSignalSeen) return;
+  try {
+    if (!doc.querySelector(`[${FIREFOX_ID_ATTRIBUTE}]`)) return;
+  } catch {
+    return;
+  }
+  firefoxSignalSeen = true;
+  emitEvent('Firefox translation markers detected');
+}
+
 function processRecords(records: MutationRecord[]): void {
   try {
     processRecordBatch(records);
@@ -882,10 +898,16 @@ export interface TranslationResilienceOptions {
  * adds a `translated-ltr`/`translated-rtl` class to <html>, measured
  * ~275-500ms ahead of the first text mutation in real Chrome. The class VALUE
  * is checked (not just "class changed") because extensions add unrelated
- * classes to <html> on ordinary page loads.
+ * classes to <html> on ordinary page loads — as exact tokens, which are all
+ * Google's script ever sets, so a page's own `untranslated-banner` is not
+ * taken for Chrome.
  */
+const TRANSLATED_CLASS = /(?:^|\s)translated-(?:ltr|rtl)(?:\s|$)/;
+
 function hasTranslatedClass(doc: Document): boolean {
-  return doc.documentElement.className.includes('translated-');
+  // The attribute, not classList: it reads the same on an SVG root, and
+  // touches nothing on <html> (jsdom caches classList as a property).
+  return TRANSLATED_CLASS.test(doc.documentElement.getAttribute('class') ?? '');
 }
 
 type PageWrite = <T>(write: () => T) => T;
@@ -1066,6 +1088,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
       attributeFilter: [FIREFOX_ID_ATTRIBUTE],
     });
     emitEvent('translation signal detected, observing document');
+    noticeFirefoxTags(doc);
   };
 
   /**

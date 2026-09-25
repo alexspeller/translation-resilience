@@ -1247,6 +1247,41 @@ describe('installed after Firefox started translating', () => {
   // that never sees it, but Firefox also tags the elements it sends to its
   // engine with data-moz-translations-id before their translation arrives —
   // which an eager observer does see.
+  it('eager mode recognises Firefox from tags already in place when it installs', async () => {
+    const { container, rerender } = render(
+      <>
+        <LinkSentenceCase word="today" />
+        <TowerCase count={4} />
+      </>
+    );
+    const [p, tower] = [...container.children];
+    const link = p?.querySelector('a');
+    if (!p || !tower || !link) throw new Error('setup failed');
+    // Firefox has started — lang written, the block with an element tagged —
+    // before the shim is installed.
+    Element.prototype.setAttribute.call(document.documentElement, 'lang', 'x-pseudo');
+    Element.prototype.setAttribute.call(link, 'data-moz-translations-id', '0');
+    await flushMicrotasks();
+
+    const uninstall = installTranslationResilience({ eager: true });
+    try {
+      // The plain-text block's translation arrives first.
+      mergeLikeFirefox(tower);
+      await flushMicrotasks();
+
+      rerender(
+        <>
+          <LinkSentenceCase word="today" />
+          <TowerCase count={5} />
+        </>
+      );
+
+      expect(tower.textContent).toBe('There are 5 lights in the tower');
+    } finally {
+      uninstall();
+    }
+  });
+
   it('eager mode recognises Firefox from the elements it tags', async () => {
     const { container, rerender } = render(<LinkSentenceCase word="today" />);
     const p = container.firstElementChild;
@@ -1265,6 +1300,33 @@ describe('installed after Firefox started translating', () => {
       rerender(<LinkSentenceCase word="tomorrow" />);
 
       expect(p.textContent).toBe(`This is a sentence ${pseudoTranslate('with a link')} written tomorrow`);
+    } finally {
+      uninstall();
+    }
+  });
+});
+
+describe('class names that merely contain "translated-"', () => {
+  afterEach(() => {
+    document.documentElement.removeAttribute('lang');
+    document.documentElement.classList.remove('page-untranslated-banner');
+  });
+
+  it('neither arms on them nor mistakes them for Chrome', async () => {
+    document.documentElement.classList.add('page-untranslated-banner');
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ onEvent: (message) => events.push(message) });
+    try {
+      expect(events).not.toContain('translation signal detected, observing document');
+      const { container, rerender } = render(<TowerCase count={4} />);
+      const div = container.firstElementChild;
+      if (!div) throw new Error('setup failed');
+      await translateLikeFirefox(div);
+
+      rerender(<TowerCase count={5} />);
+
+      expect(events).toContain('<html lang> changed from outside the page');
+      expect(div.textContent).toBe('There are 5 lights in the tower');
     } finally {
       uninstall();
     }
