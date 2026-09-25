@@ -54,8 +54,12 @@ const child = spawn(
     '--disable-gpu',
     '--no-sandbox',
   ],
-  { stdio: 'ignore' }
+  { stdio: ['ignore', 'ignore', 'pipe'] }
 );
+let chromeStderr = '';
+child.stderr.on('data', (data) => {
+  chromeStderr = (chromeStderr + data).slice(-4000);
+});
 
 const failures = [];
 function check(name, actual, expected) {
@@ -96,8 +100,10 @@ const connect = (url) =>
     ws.addEventListener('open', () => resolve(new CDP(ws)));
   });
 
+/** A cold CI runner can take well over ten seconds to bring Chrome up. */
 async function waitForBrowser() {
-  for (let attempt = 0; attempt < 100; attempt++) {
+  for (let attempt = 0; attempt < 600; attempt++) {
+    if (child.exitCode !== null || child.signalCode !== null) break;
     try {
       await http('/json/version');
       return;
@@ -105,7 +111,10 @@ async function waitForBrowser() {
       await new Promise((r) => setTimeout(r, 100));
     }
   }
-  throw new Error('Chrome did not expose the DevTools endpoint');
+  const exited = child.exitCode !== null || child.signalCode !== null;
+  throw new Error(
+    `Chrome did not expose the DevTools endpoint${exited ? ` (exited: ${child.exitCode ?? child.signalCode})` : ''}.\n${chromeStderr}`
+  );
 }
 
 /** A page with the shim installed in the main world and a translator in an isolated one. */
