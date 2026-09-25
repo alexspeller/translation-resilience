@@ -1,6 +1,6 @@
 # translation-resilience
 
-Stops browser page translation (Chrome's built-in Google Translate) from **crashing React apps** and **silently freezing translated text** — by repairing the DOM instead of swallowing errors.
+Stops browser page translation (Chrome's built-in Google Translate, Edge's translator, Firefox's full-page translation) from **crashing React apps** and **silently freezing translated text** — by repairing the DOM instead of swallowing errors.
 
 ```ts
 import { installTranslationResilience } from 'translation-resilience';
@@ -8,7 +8,7 @@ import { installTranslationResilience } from 'translation-resilience';
 installTranslationResilience();
 ```
 
-Framework-agnostic (it patches the DOM layer, not React), dependency-free, ~2.6 kB min+gzip, and lazily activated — near-zero cost until a translator actually touches the page.
+Framework-agnostic (it patches the DOM layer, not React), dependency-free, ~4.8 kB min+gzip, and lazily activated — near-zero cost until a translator actually touches the page.
 
 ## The problem
 
@@ -25,6 +25,8 @@ React keeps operating on the original, now-detached nodes:
 - **Crash**: mounting an element before translated text throws the same from `insertBefore`.
 - **Silent freeze**: updating translated text (counters, timers, live data) writes into the detached node. The visible page never updates again, with no error anywhere.
 
+Firefox's full-page translation gets to the same place by another route. It sends each block's content to its translation engine as one piece — so `There are {count} lights` travels as a single run of text — and applies the result by detaching **every** child of the block and appending the translation back, reusing the block's text nodes by position. The translated run comes back as one text node: the first of React's nodes carries the whole translation, and the rest (here, `{count}` and everything after it) are never re-attached. Same freeze, same `NotFoundError`s — `Node.removeChild: The node to be removed is not a child of this node` — from a completely different mutation shape.
+
 Background reading: [facebook/react#11538](https://github.com/facebook/react/issues/11538), [Everything about Google Translate crashing React](https://martijnhols.nl/blog/everything-about-google-translate-crashing-react). The same mechanism breaks Vue ([vuejs/core#14810](https://github.com/vuejs/core/issues/14810)) and Ember/Glimmer ([glimmerjs/glimmer-vm#1372](https://github.com/glimmerjs/glimmer-vm/issues/1372)).
 
 ## Why not the well-known monkey-patch?
@@ -38,6 +40,8 @@ Instead of swallowing errors, this shim puts the original text nodes **back** th
 1. A document-wide `MutationObserver` recognizes translation's displacement pattern (merge, wrap, remove — a pattern renderer commits never produce) and tracks each replaced text run as a *displacement group*: the ordered renderer-owned originals with their pre-translation values, plus the wrapper nodes currently standing in for them.
 2. Patched `Node.prototype.removeChild` / `insertBefore` / `appendChild` and the `nodeValue` / `data` setters detect operations on displaced text nodes and first **restore the group** — originals go back into the wrappers' position, wrappers are removed — then let the native operation proceed on a consistent tree.
 3. The translator's own observer notices the restored (now updated) text and re-translates it, so the user sees fresh, translated content. The loop is self-healing: update → restore → re-translate.
+
+For Firefox the pattern is the detach-everything-and-re-append merge, recognised only once Firefox's own signal has been seen (see "Performance cost"), so page code that happens to rebuild an element the same way is never mistaken for it elsewhere: a block whose merge left React's nodes detached (or added text nodes of its own) is tracked as a whole — its original children, in order, with their pre-translation text — and restored the same way before React touches any of them. Firefox then re-translates the restored text nodes one by one, in place.
 
 The result: no crashes, **and** live data keeps updating on translated pages — in the visitor's language.
 
@@ -75,12 +79,12 @@ installTranslationResilience({
   // Install the document-wide observer immediately instead of waiting for a
   // translation signal (see "Performance cost"). Costs more on never-translated
   // pages. Rarely needed: lazy activation covers translators that mark <html>
-  // (Chrome) and, via the detection stylesheet, translators that only wrap text
-  // in <font> (Edge, the Google Translate extension). eager buys earlier
-  // tracking for a translator that displaces text without marking <html> and
-  // without an identifiable <font> wrapper — that case is otherwise caught on
-  // the repair path, which prevents the crash but cannot re-adopt the first
-  // displacement it never saw.
+  // (Chrome's class, Firefox's lang) and, via the detection stylesheet,
+  // translators that only wrap text in <font> (Edge, the Google Translate
+  // extension). eager buys earlier tracking for a translator that displaces
+  // text without marking <html> and without an identifiable <font> wrapper —
+  // that case is otherwise caught on the repair path, which prevents the crash
+  // but cannot re-adopt the first displacement it never saw.
   eager: false,
 });
 ```
@@ -96,9 +100,10 @@ installTranslationResilience({
 
 ## Performance cost
 
-The shim is **lazily activated**. At install it patches the DOM methods and watches for two kinds of signal, whichever comes first:
+The shim is **lazily activated**. At install it patches the DOM methods and watches for these signals, whichever comes first:
 
-- **`<html>` markers.** It watches the `class` attribute of `<html>`. Chrome's built-in translator announces itself there — it adds a `translated-ltr`/`translated-rtl` class — a few hundred milliseconds *before* it touches any text (~275–500 ms measured against real Chrome). The class *value* is checked (`translated-…`), not merely "class changed", because browser extensions routinely add unrelated classes to `<html>`. `lang` is deliberately *not* watched, for the same reason: apps write it themselves — i18n libraries sync `<html lang>` once language detection resolves and on every language switch, as WCAG 3.1.1 asks — so arming on it would run the full observer on every such page. Watching it would not arm any earlier, either: Chrome adds the class first, in the same call, and only rewrites a `lang` the page already has.
+- **Chrome's `<html>` class.** Chrome's built-in translator announces itself by adding a `translated-ltr`/`translated-rtl` class to `<html>` a few hundred milliseconds *before* it touches any text (~275–500 ms measured against real Chrome). The class *value* is checked — exactly `translated-ltr` or `translated-rtl`, not merely "class changed" or any class containing `translated-` — because browser extensions and pages routinely put unrelated classes on `<html>`.
+- **Firefox's `<html lang>` write — and only Firefox's.** Firefox's translator sets `<html lang>` to the target language as it starts, well before any translated text arrives from its engine (~500 ms later with a warm engine, seconds on first use), and leaves no other cheap marker. But apps write `<html lang>` too — i18n libraries sync it once language detection resolves and on every language switch, as WCAG 3.1.1 asks — so a `lang` change on its own says nothing ([#1](https://github.com/alexspeller/translation-resilience/issues/1)). What separates them is *where the write comes from*. The page's own code reaches `<html>` through the page's JavaScript objects; a browser translator writes from its isolated world (Chrome, Edge) or through Xray wrappers (Firefox), and neither ever sees properties a page defines on an element. So the shim gives the `<html>` element — that one instance, never `Element.prototype` — its own wrappers for `setAttribute`, `setAttributeNS`, `removeAttribute`, `removeAttributeNS`, `toggleAttribute`, the `…AttributeNode` methods and the `lang` setter. A write through them is yours and is ignored; a `lang` change that arrives any other way arms the shim. (Chrome's translator also rewrites an existing `lang` from its isolated world, right after adding its class and again on "show original"; once that class has been seen, such writes count as Chrome's, not Firefox's.) Writes through an `Attr` node or `NamedNodeMap`, or a prototype method called on `<html>` directly, are classified as foreign — the cost is an observer armed early, never a missed translation, and never a masked bug: an outside `lang` write only arms the observer, it is not evidence of translation. A second copy of the package on the page (duplicated versions, micro-frontends) wraps the first copy's wrappers, so both still recognise your writes as yours, and whichever copy uninstalls last leaves `<html>` as it found it. The wrappers stay until Firefox's signal is seen — even if something else armed the shim first, since that signal is also what turns on recognition of Firefox's merges — and are removed then, or on uninstall.
 - **A detection stylesheet keyed to the translator's own `<font>` wrappers.** Not every translator marks `<html>`: Microsoft Edge's built-in translator and the Google Translate browser extension wrap text in `<font>` elements without ever touching the class or `lang`. The shim installs a stylesheet giving a 1 ms CSS animation to a translator's *signature* `<font>` — `style="vertical-align: inherit;"` (Google) or the `_msttexthash`/`_msthash`/`_mstmutation` attributes (Edge) — and arms when `animationstart` fires. Matching the signature rather than the bare tag matters because `<font>` is deprecated but not impossible for an app to render itself (via JSX, `dangerouslySetInnerHTML`, or rendered HTML/markdown); an app's own `<font>` has neither marker and is ignored. The stylesheet is installed as a constructable stylesheet (`adoptedStyleSheets`) so that a `style-src 'self'` Content-Security-Policy — which blocks an injected `<style>` element outright — does not disable detection, with a `<style>` fallback for engines without constructable stylesheet support. The rule uses `!important` so a global `* { animation: none !important }` reset cannot silence it.
 
 Only on a signal does the shim create the document-wide `MutationObserver` that does the real work. Installing on an already-marked document activates immediately, and a synchronous fallback in the patched methods covers same-realm translators (like the bundled simulator) that signal and displace in the same task.
@@ -114,7 +119,7 @@ Measured numbers, with an honest caveat: these are microbenchmarks from one mach
 - Re-rendering the table with three cells changing in every row, 50 commits: 26.9 ms → 29.1 ms (+8%, ≈ 40 µs per full-table commit). Repeated mount+unmount of the whole table: +3% (noise).
 - Writes to an attached `text.data`: ~0.05 µs → ~0.08 µs each. The worst case we could construct — a tight synchronous loop appending and removing individual detached text nodes, a pattern frameworks don't produce — ~0.2 µs → ~0.26 µs per pair.
 - The detection stylesheet adds one selector for the style engine to evaluate against elements it is already matching. Measured on a 500 × 4 grid under sustained churn (50 commits of 2,000 text writes + 1,000 insert/remove each, medians of 9 interleaved trials, headless Chrome on Apple Silicon): **+1.1%** against no detection at all. The alternatives for detecting an out-of-world translator are much more expensive — a `childList`/`subtree` `MutationObserver` measured +7.2% and the full observer +9.5% on the same benchmark. A cheap cross-world signal is the whole reason detection is a stylesheet.
-- What remains is the patched-method call indirection plus one attribute read per operation while dormant. There is no observer, so the browser allocates no mutation records.
+- What remains is the patched-method call indirection plus one attribute read per operation while dormant. There is no observer, so the browser allocates no mutation records. The `<html>` write wrappers run only when something writes an attribute on `<html>` itself.
 
 **After translation starts**, the full machinery is live: one document-wide `MutationObserver` (childList + characterData + oldValue, subtree) means a record per DOM mutation, and inserting a *detached* text node drains and processes pending records. Correlation state expires after 100 ms and is purged incrementally (amortized O(1) per entry), so steady-state memory is effectively zero. On a translated page, operations on *untranslated* content cost roughly: ≈ 0.3 ms per pathological full-table commit, ~0.3 µs per text write, ~1.8 µs per worst-case churn op. Updates to *translated* text pay the restore → re-translate cycle: ≈ 14 µs per updated text run, so a commit updating 1,500 translated runs at once costs ≈ 20 ms extra — the alternative without the shim is those updates never becoming visible at all. Translated pages that are idle cost nothing beyond the observer.
 
@@ -131,7 +136,7 @@ Against the numbers above: lazy activation already makes the never-translated ca
 
 ## Testing your app against translation: the simulator
 
-The package ships the mutation simulator used to test the shim itself — it reproduces Google Translate's exact DOM mutations (merge, segment-split, nested `<font>` wrappers, detached originals, deletions, word-order moves, and the ongoing re-translation observer) so you can write deterministic tests without a real browser translation session:
+The package ships the mutation simulator used to test the shim itself — it reproduces Google Translate's exact DOM mutations (merge, segment-split, nested `<font>` wrappers, detached originals, deletions, word-order moves, and the ongoing re-translation observer), and Firefox's detach-and-re-append merge, so you can write deterministic tests without a real browser translation session:
 
 ```ts
 import { render } from '@testing-library/react';
@@ -178,19 +183,41 @@ it('survives Edge translating the page', () => {
 
 Import the simulator before calling `installTranslationResilience()`, so the natives it captures are the unpatched ones (ES module imports are hoisted, so a normal top-level `import` already guarantees this).
 
-Note that jsdom runs no CSS animations, so the detection stylesheet never fires there; under jsdom these cases are caught by the repair-path sweep instead. The stylesheet's own behaviour is covered by `npm run test:browser`, which drives real headless Chrome and displaces text from a genuine isolated world via `Page.createIsolatedWorld`.
+### Testing Firefox's translation
+
+`translateLikeFirefox(element, translate?, targetLanguage?)` reproduces a Firefox translation of `element`: it sets `<html lang>` from outside the page, then — in a later task, as Firefox's engine replies asynchronously — merges the element the way Firefox does, leaving all but the first text node of every run detached. It returns a promise; await it. `mergeLikeFirefox(element, translate?)` performs just the merge, synchronously, for a document already being translated.
+
+```ts
+import { translateLikeFirefox } from 'translation-resilience/simulator';
+
+it('keeps counters updating when Firefox translates the page', async () => {
+  const { container, rerender } = render(<Counter count={4} />);
+
+  await translateLikeFirefox(container.firstElementChild!);
+  rerender(<Counter count={5} />);
+
+  expect(container.textContent).toContain('5');
+});
+```
+
+Note that jsdom runs no CSS animations, so the detection stylesheet never fires there; under jsdom these cases are caught by the repair-path sweep instead. jsdom also does not implement the DOM's *transient registered observers*, so it never reports a mutation made to a node after it was detached — which is exactly how Firefox overwrites the text nodes it reuses. `mergeLikeFirefox` therefore overwrites each reused node just after re-attaching it: the same records for every parent and the same final DOM, in an order jsdom can see.
+
+The real browsers are covered separately. `npm run test:browser` drives real headless Chrome and displaces text from a genuine isolated world via `Page.createIsolatedWorld`, which is also what exercises the detection stylesheet. `npm run test:firefox` drives Firefox's own full-page translator — real models, fetched on first run — against a React page, over Marionette.
 
 ## Compatibility and limitations
 
 - **Renderers**: developed and tested against React 18 (the tests render real components with `react-dom` and assert both crash-avoidance and update-visibility). React 19 benefits equally — its error-boundary teardown and the silent freeze both disappear. The patch layer is framework-agnostic, so Vue/Svelte/Ember apps should benefit too, but the test suite currently covers React.
-- **Translators**: built against Chrome's translation mutations (the merge/wrap/remove pattern, `<font>` wrappers). Covers both translators that mark `<html>` (Chrome's built-in Google Translate) and translators that only wrap text in `<font>` (Microsoft Edge's built-in translator, the Google Translate browser extension). A translator that mutates in some entirely different way simply isn't recognized — unrecognized mutations degrade to stock behavior, never worse than not having the shim (and `eager: true` widens coverage further).
+- **Translators**: covers Chrome's built-in Google Translate (marks `<html>`, merge/wrap/remove with `<font>` wrappers), translators that only wrap text in `<font>` (Microsoft Edge's built-in translator, the Google Translate browser extension), and Firefox's full-page translation (sets `<html lang>`, detach-and-re-append merge). A translator that mutates in some entirely different way simply isn't recognized — unrecognized mutations degrade to stock behavior, never worse than not having the shim (and `eager: true` widens coverage further).
+- **Firefox: install before translation starts.** Firefox's main signal is its `<html lang>` write at the start of a translation, so a lazily-activated shim installed after that write (say, loaded well after page load while "Always translate" is on) cannot tell the page is being translated. Installing in your entrypoint, as above, is early enough. With `eager: true`, a late shim still recognises Firefox from the `data-moz-translations-id` tags Firefox puts on the elements of each block it sends for translation, which stay in place until that block's translation arrives — though a page whose blocks are all plain text carries none.
+- **Firefox re-translates restored text piece by piece.** After the shim restores a block React updated, Firefox translates each restored text node on its own, so that block's translation becomes phrase-by-phrase rather than whole-sentence. That is Firefox's own handling of changed text, and it keeps later updates in place with no further restores.
 - **`event.target` inside translated text is a `<font>` element.** That's inherent to page translation, not this shim. React's synthetic event dispatch is unaffected (handlers fire on the right components with the right `currentTarget`), but avoid comparing `event.target` by identity or tag — use `closest()`/`contains()`.
 - **Word-order moves are cosmetically imperfect**: text the translator deleted for a word-order change is restored at the best position still known, which may differ from the translator's chosen ordering until re-translation catches up.
 - **Per-frame**: iframes have their own prototypes and documents; install the shim inside each frame that renders your app. (This is separate from the translator's isolated world, which shares the document and is handled.)
+- **Shadow DOM is not covered.** The observer watches the document, and mutations inside shadow roots never reach it, so a renderer mounted into a shadow root is not protected — Firefox in particular translates open and closed shadow roots.
 
 ## Demo
 
-`npm run build`, serve the repo root over HTTP (`npx serve .`), and open `/demo/`. Translate the page via Chrome's right-click → "Translate", or use the "Simulate Google Translate" button in browsers without it. `?shim=off` shows stock behavior: the toggles crash the app and the counter freezes.
+`npm run build`, serve the repo root over HTTP (`npx serve .`), and open `/demo/`. Translate the page via Chrome's right-click → "Translate" or Firefox's translate button in the address bar, or use the "Simulate Google Translate" button in browsers without either. `?shim=off` shows stock behavior: the toggles crash the app and the counter freezes.
 
 ## License
 

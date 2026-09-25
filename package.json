@@ -1,10 +1,11 @@
 {
   "name": "translation-resilience",
-  "version": "0.4.1",
-  "description": "Stops browser page translation (Google Translate) from crashing React and silently freezing translated text, by re-adopting displaced text nodes instead of swallowing errors.",
+  "version": "0.5.0",
+  "description": "Stops browser page translation (Chrome's Google Translate, Edge, Firefox) from crashing React and silently freezing translated text, by re-adopting displaced text nodes instead of swallowing errors.",
   "keywords": [
     "google-translate",
     "page-translation",
+    "firefox",
     "react",
     "notfounderror",
     "removechild",
@@ -47,9 +48,10 @@
     "build": "tsup",
     "test": "vitest run",
     "test:browser": "node scripts/browser-test.mjs",
+    "test:firefox": "node scripts/firefox-test.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
-    "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build && npm run test:browser"
+    "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build && npm run test:browser && npm run test:firefox"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.3",
