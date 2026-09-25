@@ -261,6 +261,7 @@ function clearCorrelationState(): void {
   recentOldValues.clear();
   recentCarrierAccumulated.clear();
   pendingOrphans = [];
+  forgetPageMoves();
 }
 
 /** Replacement nodes a translator produces: <font> wrappers or plain text (revert). */
@@ -653,22 +654,51 @@ function registerChildrenMerge(merge: ChildrenMerge, valuesBefore: Map<Node, str
 /**
  * Nodes the page moved or removed through the patched DOM methods since
  * records were last processed — never a translator's work (see
- * recognizeChildrenMerges). Filled only while the observer runs, and emptied
- * each time records are processed, which covers every record those calls
- * queued.
+ * recognizeChildrenMerges). Noted only while the observer runs, always after
+ * the native call has queued its records, and forgotten whenever records are
+ * processed, which covers every record those calls queued. Weakly held:
+ * mutations the observer never sees (a shadow root, a detached container)
+ * leave notes that nothing would otherwise clear.
  */
-const movedByPage = new Set<Node>();
+let movedByPage = new WeakSet<Node>();
+let pageMovesNoted = false;
 
 function notePageMove(node: Node): void {
-  if (observer) movedByPage.add(node);
+  if (!observer) return;
+  movedByPage.add(node);
+  pageMovesNoted = true;
 }
 
+function forgetPageMoves(): void {
+  if (!pageMovesNoted) return;
+  movedByPage = new WeakSet<Node>();
+  pageMovesNoted = false;
+}
+
+/**
+ * Set once Firefox's signal — <html lang> written from outside the page —
+ * has been seen. Only then are children merges recognised: nothing else
+ * produces them, and page code that happens to empty an element and put some
+ * of its text back (through APIs the shim does not patch) must never be read
+ * as one on a page Firefox is not translating.
+ */
+let firefoxSignalSeen = false;
+const NO_RECORDS: ReadonlySet<MutationRecord> = new Set();
+
 function processRecords(records: MutationRecord[]): void {
+  try {
+    processRecordBatch(records);
+  } finally {
+    forgetPageMoves();
+  }
+}
+
+function processRecordBatch(records: MutationRecord[]): void {
   if (records.length === 0) return;
   const now = performance.now();
   purgeExpired(now);
 
-  const merged = recognizeChildrenMerges(records);
+  const merged = firefoxSignalSeen ? recognizeChildrenMerges(records) : NO_RECORDS;
   let sawTranslatorActivity = false;
   for (const record of records) {
     if (merged.has(record)) continue;
@@ -702,7 +732,6 @@ function processRecords(records: MutationRecord[]): void {
   }
 
   if (sawTranslatorActivity) flushPendingOrphans();
-  movedByPage.clear();
 }
 
 /** Synchronously fold in records the observer hasn't delivered yet. */
@@ -846,6 +875,37 @@ function hasTranslatedClass(doc: Document): boolean {
 type PageWrite = <T>(write: () => T) => T;
 
 /**
+ * Shared by every copy of this package (Symbol.for), on each function it
+ * installs on <html>: whether that copy is still tracking, and how to put
+ * back what its wrapper replaced. See trackPageAttributeWrites.
+ */
+const WRAPPER_STATE = Symbol.for('translation-resilience.html-write-wrapper');
+
+interface WrapperState {
+  readonly active: boolean;
+  unwrap(): void;
+}
+
+/**
+ * If html[key] is a wrapper from a copy that has stopped tracking, returns
+ * the function that removes it. Read defensively: the state may come from a
+ * different version of this package.
+ */
+function inertWrapperOn(html: Element, key: string): (() => void) | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(html, key);
+  const fn: unknown = descriptor?.value ?? descriptor?.set;
+  if (typeof fn !== 'function') return undefined;
+  const state: unknown = Reflect.get(fn, WRAPPER_STATE);
+  if (typeof state !== 'object' || state === null) return undefined;
+  if (!('active' in state) || state.active !== false || !('unwrap' in state)) return undefined;
+  const { unwrap } = state;
+  if (typeof unwrap !== 'function') return undefined;
+  return () => {
+    unwrap.call(state);
+  };
+}
+
+/**
  * Firefox's translator sets <html lang> to the target language as it starts,
  * well before it touches any text, and marks nothing else a page can see
  * cheaply. But applications write <html lang> too — i18n libraries sync it
@@ -867,7 +927,9 @@ type PageWrite = <T>(write: () => T) => T;
  *
  * A second copy of this package on the page (duplicated versions, micro
  * frontends) wraps the first copy's wrappers rather than skipping them, so
- * both see the page's writes as the page's.
+ * both see the page's writes as the page's. Every copy tags its wrappers with
+ * WRAPPER_STATE, so whichever order copies go away in, the last one out
+ * unwinds the others' inert wrappers too and leaves <html> as it was.
  *
  * Returns a function removing every wrapper.
  */
@@ -876,24 +938,41 @@ function trackPageAttributeWrites(html: Element, asPageWrite: PageWrite): () => 
   const restorers: Array<() => void> = [];
 
   /**
-   * Defines html[key], remembering what was there — the prototype's, or
-   * another copy's wrapper, which ours calls through to. Removal puts that
-   * back, unless something has since wrapped ours: then ours stays, inert.
-   * Any failure (a non-extensible <html>) leaves that key unwrapped, which
-   * only means writes through it count as outside.
+   * Defines html[key] as `descriptor` (whose function is `fn`), remembering
+   * what was there — the prototype's, or another copy's wrapper, which ours
+   * calls through to. Removal puts that back, unless another copy has since
+   * wrapped ours: then ours stays, inert, until that copy unwinds it. Any
+   * failure (a non-extensible <html>) leaves the key unwrapped, which only
+   * means writes through it count as outside.
    */
-  const replace = (key: string, descriptor: PropertyDescriptor, isOurs: (current: PropertyDescriptor) => boolean) => {
+  const replace = (key: string, descriptor: PropertyDescriptor, fn: object): void => {
     guarded(
       `<html> ${key} wrapper`,
       () => {
         const previous = Object.getOwnPropertyDescriptor(html, key);
         if (previous && !previous.configurable) return;
+        const unwrap = (): void => {
+          if (previous) Object.defineProperty(html, key, previous);
+          else Reflect.deleteProperty(html, key);
+        };
+        const state: WrapperState = {
+          get active() {
+            return active;
+          },
+          unwrap,
+        };
+        Object.defineProperty(fn, WRAPPER_STATE, { value: state });
         Object.defineProperty(html, key, { configurable: true, enumerable: false, ...descriptor });
         restorers.push(() => {
           const current = Object.getOwnPropertyDescriptor(html, key);
-          if (!current || !isOurs(current)) return;
-          if (previous) Object.defineProperty(html, key, previous);
-          else Reflect.deleteProperty(html, key);
+          if (!current || (current.value ?? current.set) !== fn) return;
+          unwrap();
+          // Bounded: the wrappers beneath may come from another version of this package.
+          for (let depth = 0; depth < 16; depth++) {
+            const exposed = inertWrapperOn(html, key);
+            if (!exposed) break;
+            exposed();
+          }
         });
       },
       undefined
@@ -905,7 +984,7 @@ function trackPageAttributeWrites(html: Element, asPageWrite: PageWrite): () => 
     const wrapper = function (this: Element, ...args: A): R {
       return active && this === html ? asPageWrite(() => current.call(this, ...args)) : current.call(this, ...args);
     };
-    replace(key, { writable: true, value: wrapper }, (descriptor) => descriptor.value === wrapper);
+    replace(key, { writable: true, value: wrapper }, wrapper);
   };
   wrap('setAttribute', html.setAttribute);
   wrap('setAttributeNS', html.setAttributeNS);
@@ -929,7 +1008,7 @@ function trackPageAttributeWrites(html: Element, asPageWrite: PageWrite): () => 
       if (active && this === html) asPageWrite(() => setLang.call(this, value));
       else setLang.call(this, value);
     };
-    replace('lang', { get: getLang, set }, (descriptor) => descriptor.set === set);
+    replace('lang', { get: getLang, set }, set);
   }
 
   return () => {
@@ -945,12 +1024,11 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   emitEvent = options.onEvent ?? noopEvent;
 
   let teardownDetection: () => void = () => undefined;
+  let stopTrackingLang: () => void = () => undefined;
 
   const activateObserver = (): void => {
     if (observer) return;
     sentinelActive = false;
-    sentinelObserver?.disconnect();
-    sentinelObserver = null;
     teardownDetection();
     teardownDetection = () => undefined;
     observer = new MutationObserver((records) => {
@@ -976,11 +1054,16 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   /**
    * `pageWrite` is true for records produced inside one of the page's own
    * writes to <html>; a lang record anywhere else is a translator (Firefox)
-   * starting, which it does well before it changes any text.
+   * starting, which it does well before it changes any text. That is also the
+   * one thing that turns on recognition of Firefox's merges, so lang is
+   * watched until it happens — even once something else has armed the
+   * observer, and in eager mode.
    */
   const onSentinelRecords = (records: MutationRecord[], pageWrite: boolean): void => {
     if (!pageWrite && records.some((record) => record.attributeName === 'lang')) {
       emitEvent('<html lang> changed from outside the page');
+      firefoxSignalSeen = true;
+      stopTrackingLang();
       activateObserver();
       return;
     }
@@ -1072,19 +1155,26 @@ export function installTranslationResilience(options: TranslationResilienceOptio
     return true;
   };
 
+  const sentinel = new MutationObserver((records) => {
+    guarded('sentinel processing', () => onSentinelRecords(records, false), undefined);
+  });
+  sentinelObserver = sentinel;
+  sentinel.observe(doc.documentElement, { attributes: true, attributeFilter: ['lang', 'class'] });
+  const stopTrackingPageWrites = trackPageAttributeWrites(doc.documentElement, asPageWrite);
+  stopTrackingLang = () => {
+    stopTrackingLang = () => undefined;
+    sentinel.disconnect();
+    if (sentinelObserver === sentinel) sentinelObserver = null;
+    stopTrackingPageWrites();
+  };
+
   if (options.eager || hasTranslatedClass(doc)) {
     activateObserver();
   } else {
-    sentinelObserver = new MutationObserver((records) => {
-      guarded('sentinel processing', () => onSentinelRecords(records, false), undefined);
-    });
-    sentinelObserver.observe(doc.documentElement, { attributes: true, attributeFilter: ['lang', 'class'] });
     sentinelActive = true;
-    const stopTrackingPageWrites = trackPageAttributeWrites(doc.documentElement, asPageWrite);
     const removeStylesheet = installDetectionStylesheet(doc);
     doc.addEventListener('animationstart', onDetectionAnimation, true);
     teardownDetection = () => {
-      stopTrackingPageWrites();
       removeStylesheet();
       doc.removeEventListener('animationstart', onDetectionAnimation, true);
     };
@@ -1208,12 +1298,14 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   uninstallCurrent = () => {
     teardownDetection();
     teardownDetection = () => undefined;
+    stopTrackingLang();
     observer?.disconnect();
     observer = null;
     sentinelObserver?.disconnect();
     sentinelObserver = null;
     sentinelActive = false;
     translationDetected = false;
+    firefoxSignalSeen = false;
     emitEvent = noopEvent;
     clearCorrelationState();
     Node.prototype.removeChild = natives.removeChild;
