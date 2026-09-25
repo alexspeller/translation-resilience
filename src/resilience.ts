@@ -43,9 +43,10 @@
  * patched methods here ever observe a translator's own mutations, so every
  * arming signal has to be one the shared DOM raises:
  *
- *  - Chrome's translator flips `lang` and adds a `translated-*` class on
- *    <html> a few hundred ms before it touches text: an attribute sentinel
- *    catches that, and attributes are shared across worlds.
+ *  - Chrome's translator adds a `translated-*` class to <html> a few hundred
+ *    ms before it touches text: an attribute sentinel catches that, and
+ *    attributes are shared across worlds. (Not `lang` — see
+ *    hasTranslatedClass.)
  *  - Edge's translator and the Google Translate extension mark nothing. For
  *    those, a detection stylesheet (DETECTION_CSS) puts a CSS animation on the
  *    translator's signature <font>, and `animationstart` fires whichever world
@@ -602,10 +603,20 @@ export interface TranslationResilienceOptions {
 
 /**
  * Chrome's translator marks the document before it displaces any text: it
- * adds a `translated-ltr`/`translated-rtl` class and flips `lang` on <html>,
- * measured ~275-500ms ahead of the first text mutation in real Chrome. The
- * class VALUE is checked (not just "class changed") because extensions add
- * unrelated classes to <html> on ordinary page loads.
+ * adds a `translated-ltr`/`translated-rtl` class to <html>, measured
+ * ~275-500ms ahead of the first text mutation in real Chrome. The class VALUE
+ * is checked (not just "class changed") because extensions add unrelated
+ * classes to <html> on ordinary page loads.
+ *
+ * `lang` is deliberately not a signal, for the same reason: applications write
+ * it themselves — i18n libraries sync <html lang> when language detection
+ * resolves and on every switch (WCAG 3.1.1) — so arming on it would run the
+ * full observer for the whole session on every such page. It would buy no
+ * coverage in return. Google's translate script adds the class first, in the
+ * same call, and only rewrites a `lang` that is already present. Edge and the
+ * Google Translate extension never touch it. Firefox does flip it, but
+ * displaces text by detaching and re-appending children, a shape the observer
+ * does not recognise, so arming early changes nothing there.
  */
 function hasTranslatedClass(doc: Document): boolean {
   return doc.documentElement.className.includes('translated-');
@@ -648,10 +659,10 @@ export function installTranslationResilience(options: TranslationResilienceOptio
 
   /**
    * Not every translator marks <html> before it displaces text. Chrome's
-   * built-in Google Translate does (the class/lang signals above), but
+   * built-in Google Translate does (the translated-* class above), but
    * Microsoft Edge's built-in translator and the Google Translate browser
    * extension wrap text in <font> elements WITHOUT adding a translated-* class
-   * or flipping lang — so the attribute sentinel never fires and the shim would
+   * — so the attribute sentinel never fires and the shim would
    * stay dormant while the page is actively being translated, letting the
    * renderer crash exactly as it would with no shim (reported in production on
    * Edge). A <font> carrying a translator's signature (isTranslatorFontWrapper)
@@ -713,21 +724,16 @@ export function installTranslationResilience(options: TranslationResilienceOptio
   if (options.eager || hasTranslatedClass(doc)) {
     activateObserver();
   } else {
-    sentinelObserver = new MutationObserver((records) => {
+    sentinelObserver = new MutationObserver(() => {
       guarded(
         'sentinel processing',
         () => {
-          for (const record of records) {
-            if (record.attributeName === 'lang' || hasTranslatedClass(doc)) {
-              activateObserver();
-              return;
-            }
-          }
+          if (hasTranslatedClass(doc)) activateObserver();
         },
         undefined
       );
     });
-    sentinelObserver.observe(doc.documentElement, { attributes: true, attributeFilter: ['lang', 'class'] });
+    sentinelObserver.observe(doc.documentElement, { attributes: true, attributeFilter: ['class'] });
     sentinelActive = true;
     const removeStylesheet = installDetectionStylesheet(doc);
     doc.addEventListener('animationstart', onDetectionAnimation, true);
