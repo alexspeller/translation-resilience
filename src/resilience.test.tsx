@@ -413,23 +413,59 @@ describe('lazy activation', () => {
     }
   });
 
-  it('activates on a documentElement lang change alone', async () => {
-    const uninstall = installTranslationResilience();
+  it('stays dormant when the application writes <html lang> itself', async () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ onEvent: (message) => events.push(message) });
+    try {
+      const { container, rerender } = render(<CounterCase count={1} />);
+
+      // i18n libraries sync <html lang> (WCAG 3.1.1): once language detection
+      // resolves, again on every switch, sometimes rewriting the same value.
+      document.documentElement.lang = 'de';
+      await flushMicrotasks();
+      document.documentElement.setAttribute('lang', 'de');
+      rerender(<CounterCase count={2} />);
+      await flushMicrotasks();
+      document.documentElement.lang = 'fr';
+      await flushMicrotasks();
+      rerender(<CounterCase count={3} />);
+      await flushMicrotasks();
+
+      expect(container.textContent).toContain('3');
+      expect(events).not.toContain('translation signal detected, observing document');
+      expect(events).not.toContain('translation activity detected');
+    } finally {
+      uninstall();
+    }
+  });
+
+  it("arms on Chrome's translated-* class ahead of text it displaces from its isolated world", async () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ onEvent: (message) => events.push(message) });
     try {
       const { container, rerender } = render(<CounterCase count={1} />);
       const textNode = findTextNode(container, '1');
-      expect(textNode).not.toBeNull();
-      if (!textNode) return;
+      if (!textNode) throw new Error('setup failed');
 
-      document.documentElement.setAttribute('lang', 'fr');
+      document.documentElement.lang = 'de';
       await flushMicrotasks();
-      displaceViaFontOnly(textNode, 'un');
+
+      // Chrome adds the class, then rewrites the lang the page already has,
+      // a few hundred ms before it touches any text.
+      document.documentElement.classList.add('translated-ltr');
+      document.documentElement.setAttribute('lang', 'en');
+      await flushMicrotasks();
+      expect(events).toContain('translation signal detected, observing document');
+
+      displaceFromIsolatedWorld(textNode, 'one', 'google');
       await flushMicrotasks();
       rerender(<CounterCase count={2} />);
       await flushMicrotasks();
 
+      // Armed before the displacement, so the text is re-adopted rather than
+      // merely kept from crashing: the update reaches the page.
       expect(container.textContent).toContain('2');
-      expect(container.textContent).not.toContain('un');
+      expect(container.textContent).not.toContain('one');
     } finally {
       uninstall();
     }

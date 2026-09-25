@@ -216,9 +216,48 @@ try {
     await new Promise((r) => setTimeout(r, 400));
     check("stays dormant for an application's own <font>", await evaluate('window.__events'), []);
   }
+
+  {
+    // i18n libraries sync <html lang> from the page itself (WCAG 3.1.1):
+    // once detection resolves, then on every language switch.
+    const { evaluate } = await session();
+    await evaluate(`document.documentElement.lang = 'de'; 1`);
+    await new Promise((r) => setTimeout(r, 50));
+    await evaluate(`document.documentElement.setAttribute('lang', 'de'); document.documentElement.lang = 'fr'; 1`);
+    await new Promise((r) => setTimeout(r, 400));
+    check("stays dormant for an application's own <html lang> writes", await evaluate('window.__events'), []);
+  }
+
+  {
+    // Chrome's translator marks <html> from its isolated world before it
+    // touches any text: the class, then a rewrite of the page's existing lang.
+    const { evaluate, isolated } = await session();
+    await evaluate(`document.documentElement.lang = 'de'; 1`);
+    await evaluate(
+      `document.documentElement.classList.add('translated-ltr'); document.documentElement.setAttribute('lang', 'en'); 1`,
+      isolated
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    check(
+      "arms on the translated-* class set from the translator's isolated world",
+      await evaluate('window.__events'),
+      ['translation signal detected, observing document']
+    );
+  }
 } finally {
-  child.kill('SIGKILL');
-  fs.rmSync(profile, { recursive: true, force: true });
+  if (child.exitCode === null && child.signalCode === null) {
+    const exited = new Promise((resolve) => child.once('exit', resolve));
+    child.kill('SIGKILL');
+    await exited;
+  }
+  // Chrome's helper processes outlive the browser process briefly and can
+  // still be writing into the profile, so removal may race them (ENOTEMPTY).
+  // A leftover temp profile is not a test failure.
+  try {
+    fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (error) {
+    console.warn(`warning: could not remove temp profile ${profile}: ${error.message}`);
+  }
 }
 
 if (failures.length > 0) {
