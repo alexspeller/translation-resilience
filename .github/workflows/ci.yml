@@ -14,6 +14,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            scripts/react-19/package-lock.json
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
@@ -22,6 +25,6 @@ jobs:
       # Covers what jsdom cannot: a translator in the browser's own isolated
       # world, and the animationstart-based detection stylesheet.
       - run: npm run test:browser
-      # Firefox's own full-page translator against a React page. Downloads an
-      # en->fr model on first use, so it needs network access.
+      # Firefox's own full-page translator against React 18 and 19 pages.
+      # Downloads an en->fr model on first use, so it needs network access.
       - run: firefox --version && npm run test:firefox
