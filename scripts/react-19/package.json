@@ -1,0 +1,9 @@
+{
+  "name": "translation-resilience-react-19-fixture",
+  "private": true,
+  "description": "React 19 for the real-Firefox checks. Kept apart from the root install, whose react is 18 for the unit tests: react-dom 19's peer dependency on react 19 cannot share one tree with it.",
+  "dependencies": {
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  }
+}
