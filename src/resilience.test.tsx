@@ -30,6 +30,22 @@ async function markTranslatingLikeFirefox(): Promise<void> {
   await flushMicrotasks();
 }
 
+/**
+ * Yandex Browser's start of translation, as recorded from Yandex Browser 26.8:
+ * in one task it rewrites a declared <html lang> from outside the page and
+ * injects its "original text" popup.
+ */
+async function markTranslatingLikeYandex(): Promise<HTMLElement> {
+  const popup = document.createElement('div');
+  popup.id = 'tr-popup';
+  popup.className = 'tr-popup';
+  popup.setAttribute('translate', 'no');
+  nativeAppendChild.call(document.body, popup);
+  Element.prototype.setAttribute.call(document.documentElement, 'lang', 'ru');
+  await flushMicrotasks();
+  return popup;
+}
+
 /** MutationObserver callbacks are delivered as microtasks; let them run. */
 async function flushMicrotasks() {
   await Promise.resolve();
@@ -603,6 +619,37 @@ describe('translators running outside the patched realm (real browsers)', () => 
     }
   });
 
+  it("survives mounting an element before text Yandex's translator displaced", () => {
+    const uninstall = installTranslationResilience();
+    try {
+      const { container, rerender } = render(<InsertionCase show={false} />);
+      const trailing = findTextNode(container, 'trailing text');
+      if (!trailing) throw new Error('setup failed');
+
+      displaceFromIsolatedWorld(trailing, 'замыкающий текст', 'yandex');
+
+      expect(() => rerender(<InsertionCase show />)).not.toThrow();
+      expect(container.querySelector('em')).not.toBeNull();
+    } finally {
+      uninstall();
+    }
+  });
+
+  it("survives unmounting text Yandex's translator displaced", () => {
+    const uninstall = installTranslationResilience();
+    try {
+      const { container, rerender } = render(<RemovalCase show />);
+      const text = findTextNode(container, 'There are four lights!');
+      if (!text) throw new Error('setup failed');
+
+      displaceFromIsolatedWorld(text, 'Горят четыре лампы!', 'yandex');
+
+      expect(() => rerender(<RemovalCase show={false} />)).not.toThrow();
+    } finally {
+      uninstall();
+    }
+  });
+
   it('survives unmounting text an out-of-realm translator displaced', () => {
     const uninstall = installTranslationResilience();
     try {
@@ -727,6 +774,146 @@ function GreetingCase({ greeting }: { greeting: string }) {
     </div>
   );
 }
+
+/**
+ * Yandex Browser's translator wraps each run in <ya-tr-span data-type="trSpan">
+ * through two replaceChild swaps (see the simulator's 'yandex' signature,
+ * recorded from Yandex Browser 26.8), and announces itself with a popup and,
+ * when the page declares one, a <html lang> rewrite.
+ */
+describe('Yandex Browser translation', () => {
+  afterEach(() => {
+    document.documentElement.removeAttribute('lang');
+    document.getElementById('tr-popup')?.remove();
+  });
+
+  it("arms on Yandex's <html lang> write without taking it for Firefox's", async () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ onEvent: (message) => events.push(message) });
+    try {
+      render(<TowerCase count={4} />);
+      await markTranslatingLikeYandex();
+
+      expect(events).toContain('<html lang> changed by the Yandex translator');
+      expect(events).toContain('translation signal detected, observing document');
+      expect(events).not.toContain('<html lang> changed from outside the page');
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('keeps an interpolated count updating after Yandex wraps every run', async () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ onEvent: (message) => events.push(message) });
+    try {
+      const { container, rerender } = render(<TowerCase count={4} />);
+      const div = container.firstElementChild;
+      if (!div) throw new Error('setup failed');
+      await markTranslatingLikeYandex();
+
+      for (const node of [...div.childNodes]) {
+        if (node instanceof Text) displaceFromIsolatedWorld(node, pseudoTranslate(node.nodeValue ?? ''), 'yandex');
+      }
+      await flushMicrotasks();
+      expect(div.querySelectorAll('ya-tr-span')).toHaveLength(3);
+      expect(events).toContain('translation activity detected');
+
+      // Yandex wraps each Text node on its own, so only the updated run is restored.
+      rerender(<TowerCase count={5} />);
+      expect(div.textContent).toBe('[There are ]5[ lights in the tower]');
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('removes the translated text React unmounts once Yandex has been seen', async () => {
+    const uninstall = installTranslationResilience();
+    try {
+      const { container, rerender } = render(<RemovalCase show />);
+      const text = findTextNode(container, 'There are four lights!');
+      if (!text) throw new Error('setup failed');
+      await markTranslatingLikeYandex();
+
+      displaceFromIsolatedWorld(text, 'Горят четыре лампы!', 'yandex');
+      await flushMicrotasks();
+
+      expect(() => rerender(<RemovalCase show={false} />)).not.toThrow();
+      expect(container.textContent).not.toContain('Горят');
+      expect(container.querySelector('ya-tr-span')).toBeNull();
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('arms on the repair path when Yandex never touches <html lang>', () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ onEvent: (message) => events.push(message) });
+    try {
+      const { container, rerender } = render(<InsertionCase show={false} />);
+      const trailing = findTextNode(container, 'trailing text');
+      if (!trailing) throw new Error('setup failed');
+
+      displaceFromIsolatedWorld(trailing, 'замыкающий текст', 'yandex');
+      rerender(<InsertionCase show />);
+
+      expect(events).toContain('translation evidence found on repair path');
+      expect(events).not.toContain('<html lang> changed by the Yandex translator');
+    } finally {
+      uninstall();
+    }
+  });
+
+  it("still throws a genuine NotFoundError once Yandex's popup is in, before any text moves", async () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ onEvent: (message) => events.push(message) });
+    const parent = document.createElement('div');
+    try {
+      document.body.appendChild(parent);
+      await markTranslatingLikeYandex();
+      const stranger = document.createTextNode('never attached here');
+
+      expect(() => parent.insertBefore(document.createElement('em'), stranger)).toThrow();
+      expect(events).not.toContain('translation activity detected');
+    } finally {
+      parent.remove();
+      uninstall();
+    }
+  });
+
+  it('arms on a <ya-tr-span> inserted through the patched methods', () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ onEvent: (message) => events.push(message) });
+    const parent = document.createElement('div');
+    try {
+      document.body.appendChild(parent);
+      const span = document.createElement('ya-tr-span');
+      span.dataset.type = 'trSpan';
+      parent.appendChild(span);
+
+      expect(events).toContain('translation activity detected');
+    } finally {
+      parent.remove();
+      uninstall();
+    }
+  });
+
+  it('ignores an app element named ya-tr-span without the translator signature', () => {
+    const events: string[] = [];
+    const uninstall = installTranslationResilience({ onEvent: (message) => events.push(message) });
+    const parent = document.createElement('div');
+    try {
+      document.body.appendChild(parent);
+      parent.appendChild(document.createElement('ya-tr-span'));
+      const stranger = document.createTextNode('never attached here');
+
+      expect(() => parent.insertBefore(document.createElement('em'), stranger)).toThrow();
+      expect(events).toEqual([]);
+    } finally {
+      parent.remove();
+      uninstall();
+    }
+  });
+});
 
 /**
  * Firefox's full-page translator marks <html lang> from outside the page as it

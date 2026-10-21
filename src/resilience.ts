@@ -64,6 +64,9 @@
  *    those, a detection stylesheet (DETECTION_CSS) puts a CSS animation on the
  *    translator's signature <font>, and `animationstart` fires whichever world
  *    inserted it — at a fraction of the cost of observing the document.
+ *  - Yandex's translator rewrites <html lang> only if the page declares one,
+ *    but always injects its "original text" popup tens of tasks before it
+ *    wraps text in <ya-tr-span>; the detection stylesheet matches both.
  *  - Whatever still slips through lands on a patched method that is about to
  *    throw NotFoundError, where a document sweep (translationEvident) tells a
  *    translated page from a genuine renderer bug.
@@ -269,22 +272,29 @@ function looksLikeTranslatorReplacement(node: Node): boolean {
   return node instanceof Text || node.nodeName === 'FONT';
 }
 
+/** Yandex Browser's translator wraps each translated run in this custom element. */
+const YANDEX_WRAPPER_TAG = 'YA-TR-SPAN';
+
 /**
- * Recognises the <font> wrapper a page translator specifically emits — not a
- * <font> an app happens to render itself. <font> is deprecated but apps can
- * still produce one (JSX, dangerouslySetInnerHTML, rendered HTML/markdown), so
- * the tag alone is not enough; we match the translator's signature:
+ * Recognises the wrapper a page translator specifically emits — not a <font>
+ * an app happens to render itself. <font> is deprecated but apps can still
+ * produce one (JSX, dangerouslySetInnerHTML, rendered HTML/markdown), so the
+ * tag alone is not enough; we match the translator's signature:
  *
  *  - Chrome's Google Translate (built-in and the browser extension) wraps text
  *    in `<font style="vertical-align: inherit;">` (doubly nested).
  *  - Microsoft Edge's built-in translator wraps in `<font>` carrying
  *    `_msttexthash` / `_msthash` / `_mstmutation` attributes and no style.
+ *  - Yandex Browser's built-in translator wraps in `<ya-tr-span>` carrying
+ *    `data-type="trSpan"`, and marks <html> only when the page declares a lang.
  *
  * Matching the signature keeps an app's own <font> from arming the observer,
  * while still covering translators that never mark <html>.
  */
-function isTranslatorFontWrapper(node: Node): boolean {
-  if (node.nodeName !== 'FONT' || !(node instanceof HTMLElement)) return false;
+function isTranslatorWrapper(node: Node): boolean {
+  const name = node.nodeName;
+  if (name === YANDEX_WRAPPER_TAG) return node instanceof HTMLElement && node.dataset.type === 'trSpan';
+  if (name !== 'FONT' || !(node instanceof HTMLElement)) return false;
   return (
     node.style.verticalAlign === 'inherit' ||
     node.hasAttribute('_msttexthash') ||
@@ -293,11 +303,24 @@ function isTranslatorFontWrapper(node: Node): boolean {
   );
 }
 
+const YANDEX_WRAPPER_SELECTOR = 'ya-tr-span[data-type="trSpan"]';
+
 /**
- * The CSS spelling of the same signature isTranslatorFontWrapper matches.
+ * The CSS spelling of the same signature isTranslatorWrapper matches.
  * Kept deliberately adjacent to it: both must describe the same wrappers.
  */
-const TRANSLATOR_FONT_SELECTOR = 'font[_msttexthash],font[_msthash],font[_mstmutation],font[style*="vertical-align"]';
+const TRANSLATOR_WRAPPER_SELECTOR = `font[_msttexthash],font[_msthash],font[_mstmutation],font[style*="vertical-align"],${YANDEX_WRAPPER_SELECTOR}`;
+
+/**
+ * Yandex's "original text" popup. Yandex injects it a hundred milliseconds or
+ * more — tens of tasks — before it wraps the first run (measured on Yandex
+ * Browser 26.8), with or without <html lang>, so arming on it lets the observer
+ * record every displacement instead of meeting the first batch on the repair
+ * path. It announces a translation; it is not evidence of one.
+ */
+const YANDEX_POPUP_SELECTOR = 'div#tr-popup.tr-popup[translate="no"]';
+
+const YANDEX_TRANSLATOR_SELECTOR = `${YANDEX_WRAPPER_SELECTOR},${YANDEX_POPUP_SELECTOR}`;
 
 const DETECTION_ANIMATION_NAME = 'translation-resilience-detect';
 
@@ -305,7 +328,7 @@ const DETECTION_ANIMATION_NAME = 'translation-resilience-detect';
  * A browser's page translator runs in the engine's own isolated world: it
  * shares the DOM but has a separate copy of Node.prototype, so it never calls
  * the patched methods in this module. Any signal that depends on those
- * patches firing (see noticeTranslatorFont) can therefore only ever be raised
+ * patches firing (see noticeTranslatorWrapper) can therefore only ever be raised
  * by a same-realm translator such as the bundled simulator — never by Chrome,
  * Edge or Firefox. Arming has to come from the shared DOM itself.
  *
@@ -313,17 +336,17 @@ const DETECTION_ANIMATION_NAME = 'translation-resilience-detect';
  * document costs about what the full observer costs (+7.2% vs +9.5% on a
  * 500x4 grid churn benchmark, headless Chrome, medians of 9 interleaved
  * trials) — precisely the cost lazy activation exists to avoid. A CSS
- * animation keyed to the translator's signature <font> costs the style engine
- * one more selector on elements it is already matching, and raises
+ * animation keyed to the translators' signature wrappers costs the style
+ * engine a few more selectors on elements it is already matching, and raises
  * `animationstart` when a matching element enters the tree from any world:
- * +1.1% on the same benchmark.
+ * +1.1% on the same benchmark (measured with the <font> selectors alone).
  *
  * `!important` and the attribute-qualified selector keep a global
  * `* { animation: none !important }` reset from silencing the hook.
  */
 const DETECTION_CSS =
   `@keyframes ${DETECTION_ANIMATION_NAME}{from{opacity:1}to{opacity:1}}` +
-  `${TRANSLATOR_FONT_SELECTOR}{animation-duration:1ms!important;animation-name:${DETECTION_ANIMATION_NAME}!important}`;
+  `${TRANSLATOR_WRAPPER_SELECTOR},${YANDEX_POPUP_SELECTOR}{animation-duration:1ms!important;animation-name:${DETECTION_ANIMATION_NAME}!important}`;
 
 /**
  * Constructable stylesheets first: a `style-src 'self'` Content-Security-Policy
@@ -358,13 +381,22 @@ function installDetectionStylesheet(doc: Document): () => void {
 }
 
 /**
- * Whether the document currently holds a translator's signature <font>. Only
+ * Whether the document currently holds a translator's signature wrapper. Only
  * ever called from a path that is otherwise about to throw, so a
  * document-wide query is affordable there; it never runs on a healthy path.
  */
 function documentShowsTranslation(doc: Document): boolean {
   try {
-    return doc.querySelector(TRANSLATOR_FONT_SELECTOR) !== null;
+    return doc.querySelector(TRANSLATOR_WRAPPER_SELECTOR) !== null;
+  } catch {
+    return false;
+  }
+}
+
+/** Only consulted on an outside <html lang> write, which happens once per translation. */
+function yandexMarkingSeen(doc: Document): boolean {
+  try {
+    return doc.querySelector(YANDEX_TRANSLATOR_SELECTOR) !== null;
   } catch {
     return false;
   }
@@ -885,10 +917,11 @@ export interface TranslationResilienceOptions {
    * Install the document-wide observer immediately instead of waiting for a
    * translation signal. The lazy default costs nothing until translation
    * starts, and arms on Chrome's translated-* class, on Firefox's <html lang>
-   * write from outside the page, and on the translator's own <font> wrappers
-   * for translators that mark nothing (Edge's built-in translator, the Google
-   * Translate extension). eager remains as an escape hatch for a translator
-   * that marks nothing and inserts no recognizable <font> wrapper.
+   * write from outside the page, on the translator's own <font> wrappers for
+   * translators that mark nothing (Edge's built-in translator, the Google
+   * Translate extension), and on Yandex's popup and <ya-tr-span> wrappers.
+   * eager remains as an escape hatch for a translator that marks nothing and
+   * inserts no recognizable wrapper.
    */
   eager?: boolean;
 }
@@ -1106,15 +1139,22 @@ export function installTranslationResilience(options: TranslationResilienceOptio
 
   /**
    * `pageWrite` is true for records produced inside one of the page's own
-   * writes to <html>; a lang record anywhere else is a translator (Firefox)
-   * starting, which it does well before it changes any text. That is also the
-   * one thing that turns on recognition of Firefox's merges, so lang is
-   * watched until it happens — even once something else has armed the
-   * observer, and in eager mode.
+   * writes to <html>; a lang record anywhere else is a translator starting,
+   * which it does well before it changes any text. With Yandex's markup
+   * already in the document it is Yandex (which injects its popup in the same
+   * task); otherwise Firefox. Firefox's write is also the one thing that turns
+   * on recognition of Firefox's merges, so lang is watched until it happens —
+   * even once something else has armed the observer, and in eager mode.
    */
   const onSentinelRecords = (records: MutationRecord[], pageWrite: boolean): void => {
     if (hasTranslatedClass(doc)) chromeMarkingSeen = true;
     if (!pageWrite && !chromeMarkingSeen && records.some((record) => record.attributeName === 'lang')) {
+      if (yandexMarkingSeen(doc)) {
+        emitEvent('<html lang> changed by the Yandex translator');
+        stopTrackingLang();
+        activateObserver();
+        return;
+      }
       emitEvent('<html lang> changed from outside the page');
       firefoxSignalSeen = true;
       stopTrackingLang();
@@ -1149,25 +1189,26 @@ export function installTranslationResilience(options: TranslationResilienceOptio
    * — so the attribute sentinel never fires and the shim would
    * stay dormant while the page is actively being translated, letting the
    * renderer crash exactly as it would with no shim (reported in production on
-   * Edge). A <font> carrying a translator's signature (isTranslatorFontWrapper)
-   * entering the tree is an unambiguous translation signal, so arm on it too.
+   * Edge). A <font> or <ya-tr-span> carrying a translator's signature
+   * (isTranslatorWrapper) entering the tree is an unambiguous translation
+   * signal, so arm on it too.
    * Called before the native insertion runs, so the observer is watching in
    * time to record this very displacement; and translationDetected is set
    * directly, so the crash-avoidance paths engage even for a translator whose
    * mutation shape the observer does not recognise as a displacement group
    * (Edge structures its wrapping differently from Chrome). The cost while
-   * dormant is a nodeName comparison per insert — far cheaper than running the
+   * dormant is one nodeName read per insert — far cheaper than running the
    * full observer eagerly for the whole page lifetime.
    */
-  const noticeTranslatorFont = (inserted: Node): void => {
-    if (translationDetected || !isTranslatorFontWrapper(inserted)) return;
+  const noticeTranslatorWrapper = (inserted: Node): void => {
+    if (translationDetected || !isTranslatorWrapper(inserted)) return;
     activateObserver();
     markTranslationDetected();
   };
 
   /**
    * The signal that actually covers real browsers. The translator inserts its
-   * signature <font> from its own isolated world, which the patched methods
+   * signature wrapper from its own isolated world, which the patched methods
    * above never see, but the shared DOM raises `animationstart` for it via
    * DETECTION_CSS regardless of which world made the change.
    */
@@ -1176,8 +1217,18 @@ export function installTranslationResilience(options: TranslationResilienceOptio
     guarded(
       'detection animation',
       () => {
+        const target = event.target instanceof Element ? event.target : null;
+        if (target?.matches(YANDEX_POPUP_SELECTOR)) {
+          emitEvent('Yandex translator popup detected via detection stylesheet');
+          activateObserver();
+          return;
+        }
         if (translationDetected) return;
-        emitEvent('translator font detected via detection stylesheet');
+        emitEvent(
+          target?.nodeName === YANDEX_WRAPPER_TAG
+            ? 'Yandex translator wrapper detected via detection stylesheet'
+            : 'translator font detected via detection stylesheet'
+        );
         activateObserver();
         markTranslationDetected();
       },
@@ -1191,14 +1242,15 @@ export function installTranslationResilience(options: TranslationResilienceOptio
    * stylesheet installed: `animationstart` is delivered on the next style
    * update, so a renderer commit in the same task as the displacement can
    * still arrive first; and a translator that displaces text without emitting
-   * a recognisable <font> raises no animation at all. Sweeping the document
+   * a recognisable wrapper raises no animation at all. Sweeping the document
    * for translator evidence at that point is what separates "a translator
    * moved this node" from a genuine renderer bug — so the shim degrades
    * gracefully on translated pages while still throwing on untranslated ones.
    * A <html lang> change from outside the page is deliberately NOT evidence:
    * it only arms the observer. Firefox's first merge marks translation
    * detected, while a write merely misattributed to outside the page (see
-   * trackPageAttributeWrites) must not start masking genuine bugs.
+   * trackPageAttributeWrites) must not start masking genuine bugs. Yandex's
+   * popup is not evidence either; its <ya-tr-span> wrappers are.
    */
   const translationEvident = (): boolean => {
     if (translationDetected) return true;
@@ -1271,7 +1323,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
 
   Node.prototype.insertBefore = function insertBefore<T extends Node>(this: Node, node: T, child: Node | null): T {
     sentinelSyncCheck();
-    noticeTranslatorFont(node);
+    noticeTranslatorWrapper(node);
     if (node.parentNode === null) {
       if (mayBeDisplaced(node)) guarded('insertBefore node repair', () => restoreDisplaced(node), 'untracked');
     } else if (translationDetected) {
@@ -1307,7 +1359,7 @@ export function installTranslationResilience(options: TranslationResilienceOptio
 
   Node.prototype.appendChild = function appendChild<T extends Node>(this: Node, node: T): T {
     sentinelSyncCheck();
-    noticeTranslatorFont(node);
+    noticeTranslatorWrapper(node);
     if (node.parentNode === null) {
       if (mayBeDisplaced(node)) guarded('appendChild repair', () => restoreDisplaced(node), 'untracked');
     } else if (translationDetected) {

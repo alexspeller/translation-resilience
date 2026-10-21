@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Warehouse report</title>
+  <script>
+    if (new URLSearchParams(location.search).has('nolang')) document.documentElement.removeAttribute('lang');
+  </script>
+  <script src="/node_modules/react/umd/react.production.min.js"></script>
+  <script src="/node_modules/react-dom/umd/react-dom.production.min.js"></script>
+</head>
+<body>
+  <h1>Warehouse report for the morning shift</h1>
+  <p>This page lists the current state of the warehouse. The numbers below update while the shift is running.</p>
+  <div id="app"></div>
+  <script type="module">
+    import { installTranslationResilience } from '/dist/index.js';
+
+    window.__errors = [];
+    window.__events = [];
+    window.addEventListener('error', (event) => window.__errors.push(`${event.error?.name}: ${event.message}`));
+    const consoleError = console.error;
+    console.error = (...args) => {
+      window.__errors.push(args.map((arg) => (arg instanceof Error ? `${arg.name}: ${arg.message}` : String(arg))).join(' '));
+      consoleError(...args);
+    };
+    if (new URLSearchParams(location.search).get('shim') !== 'off') {
+      installTranslationResilience({ onEvent: (message) => window.__events.push(message) });
+    }
+
+    const e = React.createElement;
+    function App() {
+      const [count, setCount] = React.useState(4);
+      const [warning, setWarning] = React.useState(true);
+      const [badge, setBadge] = React.useState(false);
+      window.__actions = {
+        tick: () => setCount((value) => value + 1),
+        hideWarning: () => setWarning(false),
+        showBadge: () => setBadge(true),
+      };
+      return e(
+        React.Fragment,
+        null,
+        e('p', { id: 'counter' }, 'There are ', count, ' lights in the warehouse today.'),
+        e('p', { id: 'warning' }, warning && 'Warning: an obstruction was detected in this aisle. ', e('strong', null, 'Please check the shelves.')),
+        e('p', { id: 'badge' }, badge && e('strong', null, 'New delivery. '), 'Items arrive every morning from the central storage.')
+      );
+    }
+    ReactDOM.createRoot(document.getElementById('app')).render(e(App));
+  </script>
+</body>
+</html>
