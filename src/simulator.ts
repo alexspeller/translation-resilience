@@ -240,6 +240,7 @@ const nativeDom = {
   insertBefore: Node.prototype.insertBefore,
   removeChild: Node.prototype.removeChild,
   appendChild: Node.prototype.appendChild,
+  replaceChild: Node.prototype.replaceChild,
   setAttribute: Element.prototype.setAttribute,
   removeAttribute: Element.prototype.removeAttribute,
   setData(node: CharacterData, value: string): void {
@@ -249,7 +250,7 @@ const nativeDom = {
 };
 
 /** Which browser's wrapper markup to emit. */
-export type TranslatorSignature = 'google' | 'edge';
+export type TranslatorSignature = 'google' | 'edge' | 'yandex';
 
 /**
  * Built entirely through the captured natives — including while assembling the
@@ -258,7 +259,10 @@ export type TranslatorSignature = 'google' | 'edge';
  * path a real translator cannot reach, and the test would pass for the wrong
  * reason.
  */
-function createSignatureWrapper(translatedText: string, signature: TranslatorSignature): HTMLElement {
+function createSignatureWrapper(
+  translatedText: string,
+  signature: Exclude<TranslatorSignature, 'yandex'>
+): HTMLElement {
   const translatedNode = document.createTextNode(translatedText);
   simulatorOwnedTextNodes.add(translatedNode);
 
@@ -298,10 +302,38 @@ export function displaceFromIsolatedWorld(
 ): HTMLElement {
   const parent = textNode.parentNode;
   if (!parent) throw new Error('displaceFromIsolatedWorld: text node must be attached');
+  if (signature === 'yandex') return displaceLikeYandex(parent, textNode, translatedText);
   const wrapper = createSignatureWrapper(translatedText, signature);
   nativeDom.insertBefore.call(parent, wrapper, textNode);
   nativeDom.removeChild.call(parent, textNode);
   return wrapper;
+}
+
+/**
+ * Yandex Browser's built-in translator, as recorded from Yandex Browser 26.8:
+ * three separate mutations per run — the translation is written into the
+ * renderer's own Text node, that node is swapped for a fresh Text node, and the
+ * fresh node is swapped for `<ya-tr-span data-type="trSpan">` holding the
+ * translation. No <font>, no `translated-*` class; <html lang> is rewritten
+ * only when the page declares one.
+ */
+function displaceLikeYandex(parent: Node, textNode: Text, translatedText: string): HTMLElement {
+  const originalText = textNode.nodeValue ?? '';
+  nativeDom.setData(textNode, translatedText);
+  const fresh = document.createTextNode(translatedText);
+  simulatorOwnedTextNodes.add(fresh);
+  nativeDom.replaceChild.call(parent, fresh, textNode);
+
+  const span = document.createElement('ya-tr-span');
+  nativeDom.setAttribute.call(span, 'data-translated', 'true');
+  nativeDom.setAttribute.call(span, 'data-value', originalText);
+  nativeDom.setAttribute.call(span, 'data-translation', translatedText);
+  nativeDom.setAttribute.call(span, 'data-type', 'trSpan');
+  const translatedNode = document.createTextNode(translatedText);
+  simulatorOwnedTextNodes.add(translatedNode);
+  nativeDom.appendChild.call(span, translatedNode);
+  nativeDom.replaceChild.call(parent, span, fresh);
+  return span;
 }
 
 /**

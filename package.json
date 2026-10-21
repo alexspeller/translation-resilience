@@ -50,6 +50,7 @@
     "test:browser": "node scripts/browser-test.mjs",
     "pretest:firefox": "npm ci --prefix scripts/react-19 --no-audit --no-fund",
     "test:firefox": "node scripts/firefox-test.mjs",
+    "test:yandex": "node scripts/yandex-test.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build && npm run test:browser && npm run test:firefox"

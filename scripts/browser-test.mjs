@@ -170,6 +170,31 @@ const EDGE_DISPLACEMENT = `(function () {
   return 'displaced';
 })();`;
 
+/** Yandex's popup, injected from the isolated world tens of tasks before any text moves. */
+const YANDEX_POPUP = `(function () {
+  const popup = document.createElement('div');
+  popup.id = 'tr-popup';
+  popup.className = 'tr-popup';
+  popup.setAttribute('translate', 'no');
+  document.body.appendChild(popup);
+  return 'popup';
+})();`;
+
+/** Yandex's displacement, performed from the isolated world (see npm run test:yandex for the real one). */
+const YANDEX_DISPLACEMENT = `(function () {
+  const p = document.getElementById('p');
+  const original = p.firstChild;
+  original.data = 'замыкающий текст';
+  const fresh = document.createTextNode('замыкающий текст');
+  p.replaceChild(fresh, original);
+  const span = document.createElement('ya-tr-span');
+  span.setAttribute('data-value', 'trailing text');
+  span.setAttribute('data-type', 'trSpan');
+  span.appendChild(document.createTextNode('замыкающий текст'));
+  p.replaceChild(span, fresh);
+  return 'displaced';
+})();`;
+
 try {
   await waitForBrowser();
   console.log('real-browser checks (isolated world + detection stylesheet):');
@@ -196,6 +221,38 @@ try {
       } catch (error) { return error.name; }
     })();`);
     check('React can still mount an element before the displaced text', mounted, 'no-throw');
+  }
+
+  {
+    const { evaluate, isolated } = await session();
+    await evaluate(YANDEX_DISPLACEMENT, isolated);
+    await new Promise((r) => setTimeout(r, 400));
+    const events = await evaluate('window.__events');
+    check(
+      "arms on Yandex's <ya-tr-span> inserted from the isolated world",
+      Array.isArray(events) && events.includes('Yandex translator wrapper detected via detection stylesheet'),
+      true
+    );
+  }
+
+  {
+    const { evaluate, isolated } = await session();
+    await evaluate(YANDEX_POPUP, isolated);
+    await new Promise((r) => setTimeout(r, 400));
+    const armed = await evaluate('window.__events');
+    await evaluate(YANDEX_DISPLACEMENT, isolated);
+    await new Promise((r) => setTimeout(r, 100));
+    const removed = await evaluate(`(function () {
+      try {
+        document.getElementById('p').removeChild(window.__original);
+        return document.getElementById('p').textContent;
+      } catch (error) { return error.name; }
+    })();`);
+    check('arms on the Yandex popup before any text moves', armed, [
+      'Yandex translator popup detected via detection stylesheet',
+      'translation signal detected, observing document',
+    ]);
+    check('unmounting text Yandex displaced after the popup removes its wrapper too', removed, '');
   }
 
   {
